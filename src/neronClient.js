@@ -319,6 +319,17 @@ function mqttRequest(device, topicSuffix, payload, timeoutMs = 12000) {
           ) {
             return;
           }
+          // Broker often echoes our published command on the same tree.
+          // Real replies have status / message / callid (no outbound cmd only).
+          if (
+            json.cmd &&
+            !json.status &&
+            !json.callid &&
+            !json.uuid &&
+            json.message == null
+          ) {
+            return;
+          }
           finish(null, json);
           return;
         }
