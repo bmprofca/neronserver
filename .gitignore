@@ -1,4 +1,6 @@
 node_modules/
 .env
 agent/.env
+agent/NeronLanAgent.env
+agent/NeronLanAgent.exe
 *.log

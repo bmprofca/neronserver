@@ -1,8 +1,22 @@
-require("dotenv").config({ path: require("path").join(__dirname, "..", ".env") });
-require("dotenv").config({
-  path: require("path").join(__dirname, ".env"),
-  override: true,
-});
+/**
+ * Neron 20 LAN Agent
+ * Double-click NeronLanAgent.exe (or run-agent.cmd).
+ * Keep this window open while making cloud calls.
+ */
+const fs = require("fs");
+const path = require("path");
+
+const baseDir = process.pkg ? path.dirname(process.execPath) : __dirname;
+
+function loadEnvFile(filePath) {
+  if (!fs.existsSync(filePath)) return;
+  require("dotenv").config({ path: filePath, override: true });
+}
+
+// Prefer env next to the .exe / agent folder
+loadEnvFile(path.join(baseDir, "NeronLanAgent.env"));
+loadEnvFile(path.join(baseDir, ".env"));
+loadEnvFile(path.join(baseDir, "..", ".env"));
 
 const { executeCall, fetchLiveCalls } = require("../src/neronClient");
 
@@ -14,7 +28,6 @@ const DEVICE_ID = process.env.DEVICE_ID || "1";
 const API_KEY = process.env.API_KEY || "";
 const POLL_MS = Number(process.env.POLL_MS) || 3000;
 
-/** Optional local overrides — normally MQTT settings come from cloud API Manager */
 const LOCAL_OVERRIDE = {
   mqtt_host: process.env.NERON_HOST || process.env.MQTT_HOST || null,
   mqtt_port: process.env.NERON_PORT || process.env.MQTT_PORT || null,
@@ -26,14 +39,12 @@ const LOCAL_OVERRIDE = {
 
 function headers() {
   const out = { "Content-Type": "application/json" };
-  if (API_KEY) {
-    out["x-api-key"] = API_KEY;
-  }
+  if (API_KEY) out["x-api-key"] = API_KEY;
   return out;
 }
 
-async function cloudFetch(path, options = {}) {
-  const res = await fetch(`${CLOUD_URL}${path}`, {
+async function cloudFetch(pathName, options = {}) {
+  const res = await fetch(`${CLOUD_URL}${pathName}`, {
     ...options,
     headers: { ...headers(), ...(options.headers || {}) },
   });
@@ -63,7 +74,9 @@ async function loadDevice(force = false) {
     mqtt_token: LOCAL_OVERRIDE.mqtt_token || remote.mqtt_token,
     api_enabled: 1,
     api_type: "mqtt",
-    base_url: `http://${LOCAL_OVERRIDE.mqtt_host || remote.mqtt_host || "192.168.0.180"}`,
+    base_url: `http://${
+      LOCAL_OVERRIDE.mqtt_host || remote.mqtt_host || "192.168.0.180"
+    }`,
   };
   cachedAt = Date.now();
   return cachedDevice;
@@ -109,7 +122,9 @@ async function poll() {
         }),
       });
       console.log(
-        `Job ${job.id} ${job.type} -> ${result.success ? "ok" : "fail"}: ${result.message || ""}`
+        `Job ${job.id} ${job.type} -> ${result.success ? "ok" : "fail"}: ${
+          result.message || ""
+        }`
       );
     } catch (err) {
       await cloudFetch(`/api/jobs/${job.id}/result`, {
@@ -123,7 +138,6 @@ async function poll() {
     }
   }
 
-  // Keep cloud UI informed that agent can reach Neron MQTT (best-effort)
   try {
     await fetchLiveCalls(device);
   } catch {
@@ -141,14 +155,24 @@ async function loop() {
   }
 }
 
-if (!API_KEY) {
-  console.warn(
-    "WARNING: API_KEY is empty. Generate a key in cloud API Manager and set it in agent/.env"
-  );
+function banner() {
+  console.log("========================================");
+  console.log("  Neron 20 LAN Agent");
+  console.log("========================================");
+  console.log(`  Cloud : ${CLOUD_URL}`);
+  console.log(`  Device: ${DEVICE_ID}`);
+  console.log(`  Poll  : ${POLL_MS}ms`);
+  console.log(`  Config: ${path.join(baseDir, "NeronLanAgent.env")} or .env`);
+  console.log("  Keep this window OPEN while dialing.");
+  console.log("  Press Ctrl+C to stop.");
+  console.log("========================================");
+  if (!API_KEY) {
+    console.warn(
+      "WARNING: API_KEY is empty. Edit NeronLanAgent.env next to this program."
+    );
+  }
 }
 
-console.log(
-  `Neron 20 LAN agent started.\n  Cloud=${CLOUD_URL}\n  device=${DEVICE_ID}\n  poll=${POLL_MS}ms`
-);
+banner();
 loop();
 setInterval(loop, POLL_MS);

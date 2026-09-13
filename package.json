@@ -7,7 +7,19 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
-    "agent": "node agent/index.js"
+    "agent": "node agent/index.js",
+    "agent:build-exe": "pkg agent/index.js --targets node18-win-x64 --output agent/dist/NeronLanAgent.exe --compress GZip"
+  },
+  "bin": {
+    "neron-lan-agent": "agent/index.js"
+  },
+  "pkg": {
+    "assets": [
+      "src/neronClient.js"
+    ],
+    "scripts": [
+      "src/neronClient.js"
+    ]
   },
   "dependencies": {
     "cors": "^2.8.5",
@@ -18,6 +30,7 @@
     "mysql2": "^3.14.0"
   },
   "devDependencies": {
-    "nodemon": "^3.1.9"
+    "nodemon": "^3.1.9",
+    "pkg": "^5.8.1"
   }
 }
