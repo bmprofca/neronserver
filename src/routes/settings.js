@@ -19,6 +19,20 @@ function clean(value) {
   return text || null;
 }
 
+function isLanMqttHost(host) {
+  const h = String(host || "").toLowerCase();
+  if (!h) return false;
+  if (h === "localhost" || h === "127.0.0.1") return false;
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(h)) {
+    return (
+      h.startsWith("10.") ||
+      h.startsWith("192.168.") ||
+      /^172\.(1[6-9]|2\d|3[01])\./.test(h)
+    );
+  }
+  return h.endsWith(".local") || h.endsWith(".lan");
+}
+
 function normalizeHost(value) {
   let host = clean(value) || "192.168.0.180";
   host = host
@@ -28,11 +42,20 @@ function normalizeHost(value) {
   if (
     !host ||
     host === "127.0.0.1" ||
-    host.toLowerCase() === "localhost"
+    host.toLowerCase() === "localhost" ||
+    !isLanMqttHost(host)
   ) {
+    // Public domains (e.g. call.bmtaxopc.com) are the cloud API URL, not MQTT Host
     host = "192.168.0.180";
   }
   return host;
+}
+
+function agentIsOnline(device, maxAgeSec = 45) {
+  if (!device?.last_seen_at) return false;
+  const seen = new Date(device.last_seen_at).getTime();
+  if (Number.isNaN(seen)) return false;
+  return Date.now() - seen <= maxAgeSec * 1000;
 }
 
 function toPublicDevice(device) {
@@ -58,7 +81,23 @@ router.put("/neron", async (req, res, next) => {
     const existing = await getPrimaryDevice();
     const body = req.body || {};
     const mode = body.integration_mode === "cloud" ? "cloud" : "local";
-    const host = normalizeHost(body.mqtt_host || body.host || existing?.mqtt_host);
+    const rawHost = clean(body.mqtt_host || body.host || existing?.mqtt_host);
+    if (
+      rawHost &&
+      !isLanMqttHost(
+        rawHost
+          .replace(/^https?:\/\//i, "")
+          .replace(/\/.*$/, "")
+          .replace(/:\d+$/, "")
+      )
+    ) {
+      return res.status(400).json({
+        status: "error",
+        message:
+          "Host must be the Neron 20 LAN IP (e.g. 192.168.0.180), not the cloud domain. Use call.bmtaxopc.com only as CLOUD_URL for the office LAN agent.",
+      });
+    }
+    const host = normalizeHost(rawHost || existing?.mqtt_host);
     const port = Number(body.mqtt_port || body.port || 1883) || 1883;
     const token = clean(body.mqtt_token) || clean(body.token);
     const keepPassword =
@@ -225,6 +264,12 @@ router.post("/test-neron", async (req, res) => {
   try {
     const body = req.body || {};
     const saved = await getPrimaryDevice();
+    const mode =
+      body.integration_mode === "cloud" ||
+      saved?.integration_mode === "cloud" ||
+      saved?.api_type === "agent"
+        ? "cloud"
+        : "local";
     const host = normalizeHost(
       body.mqtt_host || body.host || saved?.mqtt_host || "192.168.0.180"
     );
@@ -244,6 +289,55 @@ router.post("/test-neron", async (req, res) => {
       "neron-nxg-01";
     const token = clean(body.mqtt_token) || clean(body.token) || saved?.mqtt_token;
 
+    // Cloud Hostinger cannot open MQTT to office LAN — verify LAN agent instead
+    if (mode === "cloud") {
+      const online = agentIsOnline(saved);
+      const ready = Boolean(token && host);
+      if (!ready) {
+        return res.status(400).json({
+          status: "error",
+          target: "neron",
+          message:
+            "Save Neron LAN Host (192.168.0.180) + Token first. Cloud URL is not the Host field.",
+          latency_ms: Date.now() - started,
+          host,
+          port,
+          mode: "cloud",
+        });
+      }
+      if (!online) {
+        if (saved?.id) {
+          await query("UPDATE devices SET status = 'offline' WHERE id = ?", [
+            saved.id,
+          ]);
+        }
+        return res.status(502).json({
+          status: "error",
+          target: "neron",
+          message:
+            "Office LAN agent is not connected. On a PC in the office run: npm run agent with CLOUD_URL=https://call.bmtaxopc.com and your API key. Host field must stay 192.168.0.180.",
+          latency_ms: Date.now() - started,
+          host,
+          port,
+          mode: "cloud",
+          agent_online: false,
+          connection_status: "Disconnected",
+        });
+      }
+      return res.json({
+        status: "success",
+        target: "neron",
+        message: `LAN agent online. Neron MQTT target ${host}:${port} will be used by the office agent.`,
+        latency_ms: Date.now() - started,
+        host,
+        port,
+        mode: "cloud",
+        agent_online: true,
+        token_present: Boolean(token),
+        connection_status: "Connected",
+      });
+    }
+
     const tcp = await tcpProbe(host, port);
     if (!tcp.ok) {
       if (saved?.id) {
@@ -254,7 +348,7 @@ router.post("/test-neron", async (req, res) => {
       return res.status(502).json({
         status: "error",
         target: "neron",
-        message: `Cannot reach Neron 20 at ${host}:${port}. ${tcp.error || "Host unreachable from this server."}`,
+        message: `Cannot reach Neron 20 at ${host}:${port}. ${tcp.error || "Host unreachable from this server."} If the API is on Hostinger, switch mode to Cloud and run the office LAN agent.`,
         latency_ms: Date.now() - started,
         host,
         port,

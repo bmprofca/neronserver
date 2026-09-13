@@ -31,6 +31,41 @@ router.get("/:id", async (req, res, next) => {
   }
 });
 
+/** Full MQTT config for the office LAN agent (API key auth) */
+router.get("/:id/agent-config", async (req, res, next) => {
+  try {
+    const rows = await query("SELECT * FROM devices WHERE id = ?", [
+      req.params.id,
+    ]);
+    const device = rows[0];
+    if (!device) {
+      return res.status(404).json({ status: "error", message: "Device not found" });
+    }
+    res.json({
+      status: "success",
+      data: {
+        id: device.id,
+        name: device.name,
+        integration_mode: device.integration_mode,
+        api_type: device.api_type,
+        api_enabled: device.api_enabled,
+        mqtt_host: device.mqtt_host || "192.168.0.180",
+        mqtt_port: device.mqtt_port || 1883,
+        mqtt_username: device.mqtt_username,
+        mqtt_password: device.mqtt_password,
+        mqtt_client_id: device.mqtt_client_id,
+        mqtt_token: device.mqtt_token,
+        default_gateway: device.default_gateway,
+        base_url: device.base_url,
+        status: device.status,
+        last_seen_at: device.last_seen_at,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.post("/", async (req, res, next) => {
   try {
     const {

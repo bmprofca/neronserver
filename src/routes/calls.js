@@ -39,12 +39,17 @@ function validateCallBody(body) {
   return null;
 }
 
+function isCloudAgentMode(device) {
+  return (
+    device &&
+    (device.integration_mode === "cloud" || device.api_type === "agent")
+  );
+}
+
 function shouldDispatchNow(device) {
   if (!device || device.api_enabled === 0) return false;
-  if (device.integration_mode === "cloud" && device.api_type === "agent") {
-    // still try local MQTT/HTTP if credentials exist on this machine
-    return canUseMqtt(device) || canUseHttp(device);
-  }
+  // Hostinger/cloud cannot reach office LAN MQTT — LAN agent polls /api/jobs
+  if (isCloudAgentMode(device)) return false;
   return canUseMqtt(device) || canUseHttp(device);
 }
 
@@ -271,6 +276,9 @@ router.post("/", async (req, res, next) => {
       result.insertId,
     ]);
     const dispatched = await dispatchIfReachable(device, created[0]);
+    if (isCloudAgentMode(device) && dispatched.status === "queued") {
+      dispatched.message = `${dispatched.message} — waiting for office LAN agent`;
+    }
     res.status(201).json({ status: "success", data: dispatched });
   } catch (err) {
     next(err);
@@ -291,6 +299,32 @@ router.post("/hangup-live", async (req, res, next) => {
       return res.status(404).json({
         status: "error",
         message: "No Neron device configured",
+      });
+    }
+
+    if (isCloudAgentMode(device)) {
+      const job = await query(
+        `INSERT INTO calls
+          (device_id, user_id, type, uuid, dialer_mode, status, message)
+         VALUES (?, ?, 'hangup', ?, 'auto_answer', 'queued', ?)`,
+        [
+          device.id,
+          req.user?.id || null,
+          callid,
+          `Hangup queued for LAN agent (callid ${callid})`,
+        ]
+      );
+      const rows = await query("SELECT * FROM calls WHERE id = ?", [
+        job.insertId,
+      ]);
+      return res.json({
+        status: "success",
+        data: {
+          status: "queued",
+          message: rows[0].message,
+          uuid: callid,
+          job_id: rows[0].id,
+        },
       });
     }
 

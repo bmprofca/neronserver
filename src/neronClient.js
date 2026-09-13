@@ -53,6 +53,23 @@ function isLocalDummyHost(host) {
   );
 }
 
+function isLanMqttHost(host) {
+  const h = String(host || "")
+    .toLowerCase()
+    .replace(/^https?:\/\//, "")
+    .replace(/\/.*$/, "")
+    .replace(/:\d+$/, "");
+  if (!h || isLocalDummyHost(h)) return false;
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(h)) {
+    return (
+      h.startsWith("10.") ||
+      h.startsWith("192.168.") ||
+      /^172\.(1[6-9]|2\d|3[01])\./.test(h)
+    );
+  }
+  return h.endsWith(".local") || h.endsWith(".lan");
+}
+
 function buildNeronUrl(baseUrl, path, params) {
   const base = deviceHost(baseUrl);
   if (!base) throw new Error("HTTP base URL missing");
@@ -196,7 +213,7 @@ function mqttConfig(device) {
     ""
   ).trim();
   host = host.replace(/:\d+$/, "");
-  if (!host || isLocalDummyHost(host)) {
+  if (!host || isLocalDummyHost(host) || !isLanMqttHost(host)) {
     host = "192.168.0.180";
   }
   return {
