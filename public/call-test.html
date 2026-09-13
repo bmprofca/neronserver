@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Neron cloud call test</title>
+    <style>
+      body {
+        font-family: Segoe UI, sans-serif;
+        max-width: 520px;
+        margin: 40px auto;
+        padding: 0 16px;
+        background: #f4f6f8;
+        color: #1a1a1a;
+      }
+      h1 {
+        font-size: 1.25rem;
+      }
+      label {
+        display: block;
+        margin-top: 12px;
+        font-size: 0.9rem;
+      }
+      input {
+        width: 100%;
+        box-sizing: border-box;
+        margin-top: 4px;
+        padding: 10px;
+        border: 1px solid #ccc;
+        border-radius: 6px;
+      }
+      button {
+        margin-top: 16px;
+        padding: 12px 18px;
+        border: 0;
+        border-radius: 6px;
+        background: #0b6bcb;
+        color: #fff;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      button:disabled {
+        opacity: 0.6;
+        cursor: wait;
+      }
+      pre {
+        margin-top: 16px;
+        padding: 12px;
+        background: #111;
+        color: #d8ffd8;
+        border-radius: 6px;
+        white-space: pre-wrap;
+        word-break: break-word;
+        min-height: 80px;
+      }
+      .hint {
+        color: #555;
+        font-size: 0.85rem;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Test call from browser (outside LAN)</h1>
+    <p class="hint">
+      Hits cloud API <code>call.bmtaxopc.com</code>. Office LAN agent must be
+      running for the phone to ring.
+    </p>
+
+    <label>
+      API key
+      <input
+        id="apiKey"
+        value="nrn_37a3e88a17e10f05c9aeac3d968ca613b9aa3c1b2329bae6"
+      />
+    </label>
+    <label>
+      Extension
+      <input id="extension" value="1001" />
+    </label>
+    <label>
+      Mobile number
+      <input id="mobile" value="7002695990" />
+    </label>
+
+    <button id="btn" type="button">Place call</button>
+    <pre id="out">Ready…</pre>
+
+    <script>
+      const out = document.getElementById("out");
+      const btn = document.getElementById("btn");
+
+      btn.addEventListener("click", async () => {
+        const apiKey = document.getElementById("apiKey").value.trim();
+        const extension = document.getElementById("extension").value.trim();
+        const caller_id_number = document.getElementById("mobile").value.trim();
+
+        btn.disabled = true;
+        out.textContent = "Calling…";
+
+        try {
+          const res = await fetch("https://call.bmtaxopc.com/api/calls", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-api-key": apiKey,
+            },
+            body: JSON.stringify({
+              type: "extnCall",
+              extension,
+              caller_id_number,
+            }),
+          });
+
+          const json = await res.json();
+          out.textContent = JSON.stringify(json, null, 2);
+          console.log(json);
+        } catch (err) {
+          out.textContent = "Error: " + err.message;
+          console.error(err);
+        } finally {
+          btn.disabled = false;
+        }
+      });
+    </script>
+  </body>
+</html>

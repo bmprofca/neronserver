@@ -325,6 +325,17 @@ function mqttRequest(device, topicSuffix, payload, timeoutMs = 12000) {
         // Ignore live events (invite, extension_status, cdr) while waiting
         // for the dial command reply.
         if (json.event) return;
+        const status = String(json.status || "").toLowerCase();
+        // Presence / registration noise, not a dial/hangup reply
+        if (
+          status === "online" ||
+          status === "offline" ||
+          status === "idle" ||
+          status === "registered" ||
+          status === "unregistered"
+        ) {
+          return;
+        }
         if (json.status || json.callid || json.message || json.livecall) {
           finish(null, json);
         }

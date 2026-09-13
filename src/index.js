@@ -1,4 +1,5 @@
 const express = require("express");
+const path = require("path");
 const cors = require("cors");
 const config = require("./config");
 const { ping } = require("./db");
@@ -12,6 +13,7 @@ const callsRouter = require("./routes/calls");
 const jobsRouter = require("./routes/jobs");
 
 const app = express();
+const publicDir = path.join(__dirname, "..", "public");
 
 app.set("trust proxy", 1);
 app.use(cors());
@@ -41,21 +43,6 @@ function healthHandler(req, res) {
     });
 }
 
-// Hostinger / panel often opens the site root — don't return bare "Not found"
-app.get("/", (req, res) => {
-  res.json({
-    status: "ok",
-    service: "neron-cloud-api",
-    message: "Neron API is running",
-    try: [
-      "/api/health",
-      "/api/auth/request-otp",
-      "/api/calls",
-      "/api/settings/neron",
-    ],
-  });
-});
-
 app.get("/health", healthHandler);
 app.get("/api/health", healthHandler);
 
@@ -65,6 +52,23 @@ app.use("/api/settings", settingsRouter);
 app.use("/api/devices", requireAuthOrKey, devicesRouter);
 app.use("/api/calls", requireAuthOrKey, callsRouter);
 app.use("/api/jobs", requireApiKey, jobsRouter);
+
+// React web app (login + dialer) — built into server/public
+app.use(express.static(publicDir));
+app.get("*", (req, res, next) => {
+  if (req.path.startsWith("/api")) return next();
+  const indexFile = path.join(publicDir, "index.html");
+  res.sendFile(indexFile, (err) => {
+    if (err) {
+      res.status(404).json({
+        status: "error",
+        message:
+          "Web UI not built yet. Run client build and copy to server/public.",
+        hint: "API still works at /api/health",
+      });
+    }
+  });
+});
 
 app.use((req, res) => {
   res.status(404).json({
@@ -104,7 +108,7 @@ async function start() {
 
   const host = process.env.HOST || "0.0.0.0";
   app.listen(config.port, host, () => {
-    console.log(`Cloud API listening on http://${host}:${config.port}`);
+    console.log(`Cloud API + web app on http://${host}:${config.port}`);
   });
 }
 
