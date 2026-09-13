@@ -13,26 +13,51 @@ const jobsRouter = require("./routes/jobs");
 
 const app = express();
 
+app.set("trust proxy", 1);
 app.use(cors());
 app.use(express.json());
 
-app.get("/api/health", async (req, res) => {
-  let database = "disconnected";
-  try {
-    await ping();
-    database = "connected";
-  } catch (err) {
-    database = err.message;
-  }
+function healthHandler(req, res) {
+  return ping()
+    .then(() => {
+      res.json({
+        status: "ok",
+        service: "neron-cloud-api",
+        device: "Neron 20",
+        database: "connected",
+        host: config.db.host,
+        path: req.path,
+      });
+    })
+    .catch((err) => {
+      res.status(200).json({
+        status: "degraded",
+        service: "neron-cloud-api",
+        device: "Neron 20",
+        database: err.message,
+        host: config.db.host,
+        path: req.path,
+      });
+    });
+}
 
+// Hostinger / panel often opens the site root — don't return bare "Not found"
+app.get("/", (req, res) => {
   res.json({
-    status: database === "connected" ? "ok" : "degraded",
+    status: "ok",
     service: "neron-cloud-api",
-    device: "Neron 20",
-    database,
-    host: config.db.host,
+    message: "Neron API is running",
+    try: [
+      "/api/health",
+      "/api/auth/request-otp",
+      "/api/calls",
+      "/api/settings/neron",
+    ],
   });
 });
+
+app.get("/health", healthHandler);
+app.get("/api/health", healthHandler);
 
 app.use("/api/auth", authRouter);
 app.use("/api/users", usersRouter);
@@ -42,7 +67,13 @@ app.use("/api/calls", requireAuthOrKey, callsRouter);
 app.use("/api/jobs", requireApiKey, jobsRouter);
 
 app.use((req, res) => {
-  res.status(404).json({ status: "error", message: "Not found" });
+  res.status(404).json({
+    status: "error",
+    message: "Not found",
+    method: req.method,
+    path: req.originalUrl,
+    hint: "Use /api/health to verify the API. Auth routes start with /api/auth/",
+  });
 });
 
 app.use((err, req, res, next) => {
@@ -71,8 +102,9 @@ async function start() {
     );
   }
 
-  app.listen(config.port, () => {
-    console.log(`Cloud API listening on http://localhost:${config.port}`);
+  const host = process.env.HOST || "0.0.0.0";
+  app.listen(config.port, host, () => {
+    console.log(`Cloud API listening on http://${host}:${config.port}`);
   });
 }
 
