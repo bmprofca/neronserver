@@ -1,0 +1,9 @@
+# Create passwords (run on host with mosquitto_passwd or inside container):
+# docker run --rm -v ${PWD}/config:/mosquitto/config eclipse-mosquitto:2 \
+#   mosquitto_passwd -c -b /mosquitto/config/passwd crm_backend 'CHANGE_ME_STRONG'
+# docker run --rm -v ${PWD}/config:/mosquitto/config eclipse-mosquitto:2 \
+#   mosquitto_passwd -b /mosquitto/config/passwd neron_office_1 'CHANGE_ME_PBX'
+# docker run --rm -v ${PWD}/config:/mosquitto/config eclipse-mosquitto:2 \
+#   mosquitto_passwd -b /mosquitto/config/passwd health 'healthpass'
+#
+# Placeholder empty file — replace after generating real passwd

@@ -1,0 +1,16 @@
+# CRM backend: publish commands, subscribe responses/events/cdr
+user crm_backend
+topic readwrite device/+/api/#
+
+# Example PBX user — replace TOKEN with the device token
+# Pattern: PBX may only use its own token topics
+user neron_office_1
+topic read device/OFFICE_TOKEN_HERE/api/+/command/#
+topic write device/OFFICE_TOKEN_HERE/api/+/response
+topic write device/OFFICE_TOKEN_HERE/api/+/event
+topic write device/OFFICE_TOKEN_HERE/api/+/cdr
+topic write device/OFFICE_TOKEN_HERE/api/+/status
+
+# Healthcheck user (optional)
+user health
+topic read \$SYS/#

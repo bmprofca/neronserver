@@ -111,6 +111,141 @@ async function migrate() {
     "api_enabled",
     "TINYINT(1) NOT NULL DEFAULT 1"
   );
+  await addColumnIfMissing("devices", "organization_id", "INT NOT NULL DEFAULT 1");
+  await addColumnIfMissing("devices", "location", "VARCHAR(120) NULL");
+  await addColumnIfMissing("devices", "firmware_version", "VARCHAR(80) NULL");
+  await addColumnIfMissing(
+    "devices",
+    "connection_status",
+    "VARCHAR(40) NULL DEFAULT 'unknown'"
+  );
+  await addColumnIfMissing("devices", "mqtt_token_enc", "TEXT NULL");
+  await addColumnIfMissing("devices", "enabled", "TINYINT(1) NOT NULL DEFAULT 1");
+
+  // Expand enums for broker mode (ignore if already applied)
+  try {
+    await query(
+      `ALTER TABLE devices
+       MODIFY COLUMN integration_mode
+       ENUM('local', 'cloud', 'broker') NOT NULL DEFAULT 'local'`
+    );
+  } catch {
+    /* already migrated or unsupported */
+  }
+  try {
+    await query(
+      `ALTER TABLE devices
+       MODIFY COLUMN api_type
+       ENUM('http', 'mqtt', 'agent', 'broker') NOT NULL DEFAULT 'agent'`
+    );
+  } catch {
+    /* already migrated */
+  }
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS pbx_extensions (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      pbx_device_id INT NOT NULL,
+      user_id INT NULL,
+      extension_number VARCHAR(40) NOT NULL,
+      extension_name VARCHAR(120) NULL,
+      extension_type VARCHAR(40) NULL,
+      current_status VARCHAR(40) NULL DEFAULT 'unknown',
+      last_status_at DATETIME NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY uq_pbx_ext (pbx_device_id, extension_number),
+      CONSTRAINT fk_pbx_ext_device FOREIGN KEY (pbx_device_id) REFERENCES devices(id) ON DELETE CASCADE
+    )
+  `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS pbx_mqtt_requests (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      pbx_device_id INT NOT NULL,
+      crm_user_id INT NULL,
+      request_id VARCHAR(64) NOT NULL,
+      command VARCHAR(80) NULL,
+      topic VARCHAR(255) NULL,
+      payload_json MEDIUMTEXT,
+      response_json MEDIUMTEXT,
+      status VARCHAR(40) NOT NULL DEFAULT 'pending',
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      completed_at DATETIME NULL,
+      UNIQUE KEY uq_pbx_req (request_id),
+      INDEX idx_pbx_req_device (pbx_device_id, created_at),
+      CONSTRAINT fk_pbx_req_device FOREIGN KEY (pbx_device_id) REFERENCES devices(id) ON DELETE CASCADE
+    )
+  `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS pbx_call_requests (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      pbx_device_id INT NOT NULL,
+      crm_user_id INT NULL,
+      contact_id VARCHAR(64) NULL,
+      request_id VARCHAR(64) NOT NULL,
+      extension_number VARCHAR(40) NULL,
+      customer_number VARCHAR(40) NULL,
+      gateway VARCHAR(80) NULL,
+      direction VARCHAR(20) NULL DEFAULT 'outbound',
+      command_type VARCHAR(40) NULL DEFAULT 'extnCall',
+      status VARCHAR(40) NOT NULL DEFAULT 'requested',
+      error_message TEXT NULL,
+      requested_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      acknowledged_at DATETIME NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY uq_pbx_call_req (request_id),
+      INDEX idx_pbx_call_req_device (pbx_device_id, created_at),
+      CONSTRAINT fk_pbx_call_req_device FOREIGN KEY (pbx_device_id) REFERENCES devices(id) ON DELETE CASCADE
+    )
+  `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS pbx_calls (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      pbx_device_id INT NOT NULL,
+      crm_user_id INT NULL,
+      contact_id VARCHAR(64) NULL,
+      legacy_call_id INT NULL,
+      request_id VARCHAR(64) NOT NULL,
+      call_id VARCHAR(80) NULL,
+      uuid VARCHAR(80) NULL,
+      extension_number VARCHAR(40) NULL,
+      customer_number VARCHAR(40) NULL,
+      direction VARCHAR(20) NULL DEFAULT 'outbound',
+      call_status VARCHAR(40) NOT NULL DEFAULT 'requested',
+      started_at DATETIME NULL,
+      ringing_at DATETIME NULL,
+      answered_at DATETIME NULL,
+      ended_at DATETIME NULL,
+      duration_seconds INT NULL,
+      billable_seconds INT NULL,
+      hangup_cause VARCHAR(120) NULL,
+      recording_reference VARCHAR(255) NULL,
+      raw_cdr_json MEDIUMTEXT NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY uq_pbx_calls_request (request_id),
+      UNIQUE KEY uq_pbx_calls_callid (call_id),
+      INDEX idx_pbx_calls_device_created (pbx_device_id, created_at),
+      INDEX idx_pbx_calls_customer (customer_number),
+      CONSTRAINT fk_pbx_calls_device FOREIGN KEY (pbx_device_id) REFERENCES devices(id) ON DELETE CASCADE
+    )
+  `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS pbx_audit_log (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      pbx_device_id INT NULL,
+      crm_user_id INT NULL,
+      action VARCHAR(80) NOT NULL,
+      detail_json MEDIUMTEXT NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_pbx_audit_created (created_at)
+    )
+  `);
 
   const existing = await query(
     "SELECT id FROM devices WHERE model = 'Neron 20' LIMIT 1"

@@ -22,7 +22,9 @@ function signUser(user) {
 }
 
 function requireAuth(req, res, next) {
-  const token = readBearer(req);
+  const token =
+    readBearer(req) ||
+    String(req.query.access_token || req.query.token || "").trim();
   if (!token) {
     return res.status(401).json({ status: "error", message: "Login required" });
   }

@@ -46,10 +46,19 @@ function isCloudAgentMode(device) {
   );
 }
 
+function isBrokerMode(device) {
+  return (
+    device &&
+    (device.integration_mode === "broker" || device.api_type === "broker")
+  );
+}
+
 function shouldDispatchNow(device) {
   if (!device || device.api_enabled === 0) return false;
   // Hostinger/cloud cannot reach office LAN MQTT — LAN agent polls /api/jobs
   if (isCloudAgentMode(device)) return false;
+  // Broker mode dials go through /api/pbx + public MQTT, never LAN 192.168.x
+  if (isBrokerMode(device)) return false;
   return canUseMqtt(device) || canUseHttp(device);
 }
 
@@ -139,42 +148,47 @@ router.get("/live", async (req, res, next) => {
 
     let live = [];
     let liveError = null;
-    try {
-      const result = await fetchLiveCalls(device);
-      const raw = result.json?.livecall || result.json?.message || result.json;
-      const list = Array.isArray(raw) ? raw : raw ? [raw] : [];
-      live = list.filter((item) => {
-        if (!item || typeof item !== "object") return false;
-        if (item.event && !item.caller && !item.called && !item.callid) {
-          return false;
+    if (isBrokerMode(device)) {
+      // Cloud cannot open MQTT to office LAN; live state comes from broker SSE/events
+      liveError = null;
+    } else {
+      try {
+        const result = await fetchLiveCalls(device);
+        const raw = result.json?.livecall || result.json?.message || result.json;
+        const list = Array.isArray(raw) ? raw : raw ? [raw] : [];
+        live = list.filter((item) => {
+          if (!item || typeof item !== "object") return false;
+          if (item.event && !item.caller && !item.called && !item.callid) {
+            return false;
+          }
+          const state = String(
+            item.state || item.callstate || item.status || ""
+          ).toLowerCase();
+          // Only hide clearly ended channels
+          if (
+            state.includes("idle") ||
+            state.includes("hangup") ||
+            state.includes("down") ||
+            state.includes("destroy") ||
+            state === "offline"
+          ) {
+            return false;
+          }
+          return Boolean(
+            item.callid ||
+              item.uuid ||
+              item.caller ||
+              item.called ||
+              item.cid_num ||
+              item.dest
+          );
+        });
+        if (!result.ok && result.error) {
+          liveError = result.error;
         }
-        const state = String(
-          item.state || item.callstate || item.status || ""
-        ).toLowerCase();
-        // Only hide clearly ended channels
-        if (
-          state.includes("idle") ||
-          state.includes("hangup") ||
-          state.includes("down") ||
-          state.includes("destroy") ||
-          state === "offline"
-        ) {
-          return false;
-        }
-        return Boolean(
-          item.callid ||
-            item.uuid ||
-            item.caller ||
-            item.called ||
-            item.cid_num ||
-            item.dest
-        );
-      });
-      if (!result.ok && result.error) {
-        liveError = result.error;
+      } catch (err) {
+        liveError = err.message;
       }
-    } catch (err) {
-      liveError = err.message;
     }
 
     res.json({
@@ -238,6 +252,14 @@ router.post("/", async (req, res, next) => {
       return res.status(400).json({
         status: "error",
         message: "Enter a valid 10-digit mobile number",
+      });
+    }
+
+    if (isBrokerMode(device)) {
+      return res.status(400).json({
+        status: "error",
+        message:
+          "Device is in Broker mode. Use the Dialer (POST /api/pbx/calls) — cloud cannot open MQTT to 192.168.x.x.",
       });
     }
 
@@ -324,6 +346,32 @@ router.post("/hangup-live", async (req, res, next) => {
           message: rows[0].message,
           uuid: callid,
           job_id: rows[0].id,
+        },
+      });
+    }
+
+    if (isBrokerMode(device)) {
+      const { hangupCall } = require("../mqtt/brokerService");
+      try {
+        await hangupCall(device, callid);
+      } catch (err) {
+        return res.status(502).json({
+          status: "error",
+          message: err.message || "Broker hangup failed",
+        });
+      }
+      await query(
+        `UPDATE calls
+         SET status = 'hungup', message = 'Call disconnected', uuid = COALESCE(uuid, ?)
+         WHERE uuid = ? OR (status IN ('success', 'dispatching', 'queued') AND type != 'hangup')`,
+        [callid, callid]
+      );
+      return res.json({
+        status: "success",
+        data: {
+          status: "hungup",
+          message: "Hangup sent via MQTT broker",
+          uuid: callid,
         },
       });
     }

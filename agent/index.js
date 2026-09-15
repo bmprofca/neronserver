@@ -8,15 +8,15 @@ const path = require("path");
 
 const baseDir = process.pkg ? path.dirname(process.execPath) : __dirname;
 
-function loadEnvFile(filePath) {
+function loadEnvFile(filePath, override = true) {
   if (!fs.existsSync(filePath)) return;
-  require("dotenv").config({ path: filePath, override: true });
+  require("dotenv").config({ path: filePath, override });
 }
 
-// Prefer env next to the .exe / agent folder
-loadEnvFile(path.join(baseDir, "NeronLanAgent.env"));
-loadEnvFile(path.join(baseDir, ".env"));
-loadEnvFile(path.join(baseDir, "..", ".env"));
+// Parent server/.env first (DB etc.) — do not let empty API_KEY wipe agent key
+loadEnvFile(path.join(baseDir, "..", ".env"), false);
+loadEnvFile(path.join(baseDir, "NeronLanAgent.env"), true);
+loadEnvFile(path.join(baseDir, ".env"), true);
 
 const { executeCall, fetchLiveCalls } = require("../src/neronClient");
 

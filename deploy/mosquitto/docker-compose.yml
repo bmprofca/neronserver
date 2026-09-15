@@ -1,0 +1,30 @@
+# Eclipse Mosquitto — public MQTT broker for Neron outbound + CRM backend
+# Usage:
+#   cd deploy/mosquitto
+#   # Generate TLS certs (dev): see README.md
+#   docker compose up -d
+
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: neron-mqtt-broker
+    restart: unless-stopped
+    ports:
+      - "8883:8883"
+    volumes:
+      - ./config/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./config/passwd:/mosquitto/config/passwd:ro
+      - ./config/acl:/mosquitto/config/acl:ro
+      - ./certs:/mosquitto/certs:ro
+      - mosquitto_data:/mosquitto/data
+      - mosquitto_log:/mosquitto/log
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_sub -h localhost -p 8883 -t '$$SYS/#' -C 1 -W 3 --cafile /mosquitto/certs/ca.crt -u health -P healthpass || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  mosquitto_data:
+  mosquitto_log:

@@ -3,4 +3,6 @@ node_modules/
 agent/.env
 agent/NeronLanAgent.env
 agent/NeronLanAgent.exe
+agent/dist/*.exe
 *.log
+public/static/**/*.map

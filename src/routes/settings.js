@@ -5,6 +5,9 @@ const express = require("express");
 const { query, ping } = require("../db");
 const { requireAuth, requireAdmin } = require("../middleware/auth");
 
+const { encryptSecret } = require("../security/secrets");
+const { subscribeAll } = require("../mqtt/brokerService");
+
 const router = express.Router();
 
 router.use(requireAuth, requireAdmin);
@@ -80,25 +83,42 @@ router.put("/neron", async (req, res, next) => {
   try {
     const existing = await getPrimaryDevice();
     const body = req.body || {};
-    const mode = body.integration_mode === "cloud" ? "cloud" : "local";
-    const rawHost = clean(body.mqtt_host || body.host || existing?.mqtt_host);
-    if (
-      rawHost &&
-      !isLanMqttHost(
-        rawHost
-          .replace(/^https?:\/\//i, "")
-          .replace(/\/.*$/, "")
-          .replace(/:\d+$/, "")
-      )
-    ) {
-      return res.status(400).json({
-        status: "error",
-        message:
-          "Host must be the Neron 20 LAN IP (e.g. 192.168.0.180), not the cloud domain. Use call.bmtaxopc.com only as CLOUD_URL for the office LAN agent.",
-      });
+    const mode =
+      body.integration_mode === "cloud"
+        ? "cloud"
+        : body.integration_mode === "broker"
+          ? "broker"
+          : "local";
+
+    let host = "192.168.0.180";
+    let port = Number(body.mqtt_port || body.port || 1883) || 1883;
+
+    if (mode === "broker") {
+      // Public broker host is server env (MQTT_BROKER_URL), not device LAN IP.
+      // Store optional display hint from body.broker_host if provided.
+      host = clean(body.broker_host) || clean(body.mqtt_host) || "broker";
+      port = Number(body.mqtt_port || 8883) || 8883;
+    } else {
+      const rawHost = clean(body.mqtt_host || body.host || existing?.mqtt_host);
+      if (
+        rawHost &&
+        !isLanMqttHost(
+          rawHost
+            .replace(/^https?:\/\//i, "")
+            .replace(/\/.*$/, "")
+            .replace(/:\d+$/, "")
+        )
+      ) {
+        return res.status(400).json({
+          status: "error",
+          message:
+            "Host must be the Neron 20 LAN IP (e.g. 192.168.0.180), not the cloud domain. For no-agent setup use Broker mode.",
+        });
+      }
+      host = normalizeHost(rawHost || existing?.mqtt_host);
+      port = Number(body.mqtt_port || body.port || 1883) || 1883;
     }
-    const host = normalizeHost(rawHost || existing?.mqtt_host);
-    const port = Number(body.mqtt_port || body.port || 1883) || 1883;
+
     const token = clean(body.mqtt_token) || clean(body.token);
     const keepPassword =
       body.mqtt_password === "********" || body.mqtt_password === undefined;
@@ -111,7 +131,7 @@ router.put("/neron", async (req, res, next) => {
       model: "Neron 20",
       api_enabled: body.api_enabled === false || body.api_enabled === 0 ? 0 : 1,
       integration_mode: mode,
-      api_type: mode === "cloud" ? "agent" : "mqtt",
+      api_type: mode === "cloud" ? "agent" : mode === "broker" ? "broker" : "mqtt",
       mqtt_host: host,
       mqtt_port: port,
       mqtt_username: clean(body.mqtt_username) || clean(body.username),
@@ -119,7 +139,8 @@ router.put("/neron", async (req, res, next) => {
       mqtt_client_id:
         clean(body.mqtt_client_id) || clean(body.client_id) || "neron-nxg-01",
       mqtt_token: token,
-      base_url: `http://${host}`,
+      mqtt_token_enc: token ? encryptSecret(token) : existing?.mqtt_token_enc || null,
+      base_url: mode === "broker" ? null : `http://${host}`,
       luci_api_url: clean(body.luci_api_url),
       default_gateway: clean(body.default_gateway),
       notes: clean(body.notes),
@@ -131,8 +152,8 @@ router.put("/neron", async (req, res, next) => {
         `INSERT INTO devices
           (name, model, api_enabled, integration_mode, api_type, mqtt_host,
            mqtt_port, mqtt_username, mqtt_password, mqtt_client_id, mqtt_token,
-           base_url, luci_api_url, default_gateway, notes, status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           mqtt_token_enc, base_url, luci_api_url, default_gateway, notes, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           values.name,
           values.model,
@@ -145,6 +166,7 @@ router.put("/neron", async (req, res, next) => {
           values.mqtt_password,
           values.mqtt_client_id,
           values.mqtt_token,
+          values.mqtt_token_enc,
           values.base_url,
           values.luci_api_url,
           values.default_gateway,
@@ -152,6 +174,13 @@ router.put("/neron", async (req, res, next) => {
           values.status,
         ]
       );
+      if (mode === "broker") {
+        try {
+          await subscribeAll();
+        } catch {
+          /* broker may be offline */
+        }
+      }
       const rows = await query("SELECT * FROM devices WHERE id = ?", [
         result.insertId,
       ]);
@@ -162,8 +191,8 @@ router.put("/neron", async (req, res, next) => {
       `UPDATE devices
        SET name = ?, api_enabled = ?, integration_mode = ?, api_type = ?,
            mqtt_host = ?, mqtt_port = ?, mqtt_username = ?, mqtt_password = ?,
-           mqtt_client_id = ?, mqtt_token = ?, base_url = ?, luci_api_url = ?,
-           default_gateway = ?, notes = ?
+           mqtt_client_id = ?, mqtt_token = ?, mqtt_token_enc = ?, base_url = ?,
+           luci_api_url = ?, default_gateway = ?, notes = ?
        WHERE id = ?`,
       [
         values.name,
@@ -176,6 +205,7 @@ router.put("/neron", async (req, res, next) => {
         values.mqtt_password,
         values.mqtt_client_id,
         values.mqtt_token,
+        values.mqtt_token_enc,
         values.base_url,
         values.luci_api_url,
         values.default_gateway,
@@ -183,6 +213,13 @@ router.put("/neron", async (req, res, next) => {
         existing.id,
       ]
     );
+    if (mode === "broker") {
+      try {
+        await subscribeAll();
+      } catch {
+        /* broker may be offline */
+      }
+    }
     const rows = await query("SELECT * FROM devices WHERE id = ?", [existing.id]);
     res.json({ status: "success", data: toPublicDevice(rows[0]) });
   } catch (err) {
@@ -265,11 +302,15 @@ router.post("/test-neron", async (req, res) => {
     const body = req.body || {};
     const saved = await getPrimaryDevice();
     const mode =
-      body.integration_mode === "cloud" ||
-      saved?.integration_mode === "cloud" ||
-      saved?.api_type === "agent"
-        ? "cloud"
-        : "local";
+      body.integration_mode === "broker" ||
+      saved?.integration_mode === "broker" ||
+      saved?.api_type === "broker"
+        ? "broker"
+        : body.integration_mode === "cloud" ||
+            saved?.integration_mode === "cloud" ||
+            saved?.api_type === "agent"
+          ? "cloud"
+          : "local";
     const host = normalizeHost(
       body.mqtt_host || body.host || saved?.mqtt_host || "192.168.0.180"
     );
@@ -288,6 +329,70 @@ router.post("/test-neron", async (req, res) => {
       saved?.mqtt_client_id ||
       "neron-nxg-01";
     const token = clean(body.mqtt_token) || clean(body.token) || saved?.mqtt_token;
+
+    if (mode === "broker") {
+      const { health, probeDevice } = require("../mqtt/brokerService");
+      const mh = health();
+      if (!mh.brokerConfigured) {
+        return res.status(503).json({
+          status: "error",
+          target: "neron",
+          message:
+            "Set MQTT_BROKER_URL on the server (.env) so CRM connects to the public broker.",
+          latency_ms: Date.now() - started,
+          mode: "broker",
+        });
+      }
+      if (!mh.connected) {
+        return res.status(503).json({
+          status: "error",
+          target: "neron",
+          message:
+            "CRM backend is not connected to the MQTT broker yet. Check broker TLS/credentials.",
+          latency_ms: Date.now() - started,
+          mode: "broker",
+          mqtt: mh,
+        });
+      }
+      if (!token) {
+        return res.status(400).json({
+          status: "error",
+          target: "neron",
+          message: "Save the Neron device Token, then configure Neron to connect outbound to the broker.",
+          latency_ms: Date.now() - started,
+          mode: "broker",
+        });
+      }
+
+      // PBX "Connected" means TCP to broker — it may not publish events while idle.
+      // Probe with deviceInfo so we verify MQTT topic/token path.
+      try {
+        await probeDevice(saved, 10000);
+      } catch (err) {
+        return res.status(502).json({
+          status: "error",
+          target: "neron",
+          message:
+            `Broker is up, but Neron did not answer MQTT probe (${err.message}). Confirm Host/Port/User/Pass/Token match CRM, TLS OFF on port 1883.`,
+          latency_ms: Date.now() - started,
+          mode: "broker",
+          connection_status: "Disconnected",
+          mqtt: mh,
+        });
+      }
+
+      return res.json({
+        status: "success",
+        target: "neron",
+        message:
+          "Broker mode OK — Neron answered MQTT probe (no LAN agent needed).",
+        latency_ms: Date.now() - started,
+        mode: "broker",
+        connection_status: "Connected",
+        mqtt: mh,
+        token_present: true,
+      });
+    }
 
     // Cloud Hostinger cannot open MQTT to office LAN — verify LAN agent instead
     if (mode === "cloud") {

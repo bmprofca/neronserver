@@ -8,7 +8,10 @@
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
     "agent": "node agent/index.js",
-    "agent:build-exe": "pkg agent/index.js --targets node18-win-x64 --output agent/dist/NeronLanAgent.exe --compress GZip"
+    "agent:build-exe": "pkg agent/index.js --targets node18-win-x64 --output agent/dist/NeronLanAgent.exe --compress GZip",
+    "test": "node scripts/test-mqtt-unit.js",
+    "mqtt:simulate-neron": "node scripts/mqtt-simulate-neron.js",
+    "mqtt:test-connection": "node scripts/mqtt-test-connection.js"
   },
   "bin": {
     "neron-lan-agent": "agent/index.js"
@@ -25,6 +28,7 @@
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
+    "express-rate-limit": "^8.7.0",
     "jsonwebtoken": "^9.0.2",
     "mqtt": "^5.15.2",
     "mysql2": "^3.14.0"

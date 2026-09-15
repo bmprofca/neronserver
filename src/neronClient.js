@@ -204,6 +204,13 @@ function neronGet(url, timeoutMs = 12000) {
   });
 }
 
+function isBrokerModeDevice(device) {
+  return Boolean(
+    device &&
+      (device.integration_mode === "broker" || device.api_type === "broker")
+  );
+}
+
 function mqttConfig(device) {
   let host = (
     device.mqtt_host ||
@@ -213,8 +220,12 @@ function mqttConfig(device) {
     ""
   ).trim();
   host = host.replace(/:\d+$/, "");
-  if (!host || isLocalDummyHost(host) || !isLanMqttHost(host)) {
-    host = "192.168.0.180";
+  // Local/cloud dials need a LAN IP. Never rewrite public broker hostnames
+  // (e.g. broker.emqx.io) to 192.168.0.180 — that causes ECONNREFUSED from cloud.
+  if (!isBrokerModeDevice(device)) {
+    if (!host || isLocalDummyHost(host) || !isLanMqttHost(host)) {
+      host = "192.168.0.180";
+    }
   }
   return {
     host,
