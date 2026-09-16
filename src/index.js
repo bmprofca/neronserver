@@ -12,6 +12,7 @@ const devicesRouter = require("./routes/devices");
 const callsRouter = require("./routes/calls");
 const jobsRouter = require("./routes/jobs");
 const pbxRouter = require("./routes/pbx");
+const appsRouter = require("./routes/apps");
 const { connectBroker, health: mqttHealth, shutdown } = require("./mqtt/brokerService");
 
 const app = express();
@@ -57,6 +58,13 @@ app.use("/api/devices", requireAuthOrKey, devicesRouter);
 app.use("/api/calls", requireAuthOrKey, callsRouter);
 app.use("/api/jobs", requireApiKey, jobsRouter);
 app.use("/api/pbx", pbxRouter);
+app.use("/api/apps", appsRouter);
+app.use("/api/inbound", require("./routes/inbound"));
+app.use("/api/org", require("./routes/org"));
+app.use("/api/cdr", require("./routes/cdr"));
+app.use("/api/bulk", require("./routes/bulk"));
+// Public CRM alias used by inbound API docs / partners
+app.use("/api/v1/inbound", require("./routes/inbound"));
 
 app.use(express.static(publicDir));
 app.get("*", (req, res, next) => {

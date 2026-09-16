@@ -2,7 +2,7 @@ const express = require("express");
 const rateLimit = require("express-rate-limit");
 const { query } = require("../db");
 const config = require("../config");
-const { requireAuth, requireAdmin } = require("../middleware/auth");
+const { requireAuth, requireAdmin, requireAuthOrKey } = require("../middleware/auth");
 const { encryptSecret, decryptSecret, maskToken } = require("../security/secrets");
 const { normalizePhoneNumber } = require("../utils/phone");
 const {
@@ -13,8 +13,10 @@ const {
   subscribeAll,
   releaseExtension,
   setExtensionStatus,
+  reconcileExtensionPresence,
 } = require("../mqtt/brokerService");
 const { liveBus } = require("../realtime/liveBus");
+const { resolveAppId, assertMqttFieldsUnique, deviceTokenPlain } = require("../appsHelper");
 
 const router = express.Router();
 
@@ -37,6 +39,14 @@ function isBusyExtensionError(err) {
     msg.includes("busy")
   );
 }
+
+function isMqttTimeoutError(err) {
+  const msg = String(err?.message || err || "").toLowerCase();
+  return msg.includes("timed out") || msg.includes("timeout");
+}
+
+/** Short ACK wait after dial is on the wire — do not block ring on slow PBX replies. */
+const DIAL_ACK_TIMEOUT_MS = Number(process.env.DIAL_ACK_TIMEOUT_MS) || 4000;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -89,7 +99,22 @@ async function getDevice(id) {
   return rows[0] || null;
 }
 
-async function getPrimaryBrokerDevice() {
+async function getPrimaryBrokerDevice(appId) {
+  if (appId) {
+    const rows = await query(
+      `SELECT * FROM devices
+       WHERE app_id = ? AND api_enabled = 1
+         AND (integration_mode = 'broker' OR api_type = 'broker')
+       ORDER BY id ASC LIMIT 1`,
+      [appId]
+    );
+    if (rows[0]) return rows[0];
+    const any = await query(
+      "SELECT * FROM devices WHERE app_id = ? ORDER BY id ASC LIMIT 1",
+      [appId]
+    );
+    if (any[0]) return any[0];
+  }
   const rows = await query(
     `SELECT * FROM devices
      WHERE api_enabled = 1 AND (integration_mode = 'broker' OR api_type = 'broker')
@@ -129,9 +154,10 @@ router.get("/mqtt/health", requireAuth, (req, res) => {
   res.json({ status: "success", data: mqttHealth() });
 });
 
-router.get("/extensions", requireAuth, async (req, res, next) => {
+router.get("/extensions", requireAuthOrKey, async (req, res, next) => {
   try {
-    const device = await getPrimaryBrokerDevice();
+    const appId = await resolveAppId(req);
+    const device = await getPrimaryBrokerDevice(appId);
     if (!device) {
       return res.json({ status: "success", data: [] });
     }
@@ -156,31 +182,23 @@ router.get("/extensions", requireAuth, async (req, res, next) => {
   }
 });
 
-router.get("/extensions/:extension", requireAuth, async (req, res, next) => {
+router.get("/extensions/:extension", requireAuthOrKey, async (req, res, next) => {
   try {
     const extension = String(req.params.extension || "").trim();
-    const device = await getPrimaryBrokerDevice();
+    const appId = await resolveAppId(req);
+    const device = await getPrimaryBrokerDevice(appId);
     if (!device) {
       return res.status(404).json({ status: "error", message: "No PBX device" });
     }
+    const reconciled = await reconcileExtensionPresence(device.id, extension);
+    let status = reconciled.status || "idle";
+    const active = reconciled.active ? [reconciled.active] : [];
     let rows = await query(
       `SELECT * FROM pbx_extensions
        WHERE pbx_device_id = ? AND extension_number = ?
        LIMIT 1`,
       [device.id, extension]
     );
-    const active = await query(
-      `SELECT id, call_id, call_status, customer_number, started_at, answered_at
-       FROM pbx_calls
-       WHERE extension_number = ?
-         AND call_status IN (${ACTIVE_CALL_STATUSES.map(() => "?").join(",")})
-       ORDER BY id DESC LIMIT 1`,
-      [extension, ...ACTIVE_CALL_STATUSES]
-    );
-    let status = rows[0]?.current_status || "idle";
-    if (active[0] && (!status || status === "idle" || status === "unknown")) {
-      status = active[0].call_status === "answered" ? "inuse" : "ringing";
-    }
     if (!rows[0]) {
       rows = [
         {
@@ -205,10 +223,11 @@ router.get("/extensions/:extension", requireAuth, async (req, res, next) => {
   }
 });
 
-router.post("/extensions/:extension/release", requireAuth, async (req, res, next) => {
+router.post("/extensions/:extension/release", requireAuthOrKey, async (req, res, next) => {
   try {
     const extension = String(req.params.extension || "").trim();
-    const device = await getPrimaryBrokerDevice();
+    const appId = await resolveAppId(req);
+    const device = await getPrimaryBrokerDevice(appId);
     if (!device) {
       return res.status(404).json({ status: "error", message: "No PBX device" });
     }
@@ -358,6 +377,20 @@ router.put("/devices/:id/broker", requireAuth, requireAdmin, async (req, res, ne
       tokenPlain = String(body.device_token).trim();
       tokenEnc = encryptSecret(tokenPlain);
     }
+    const nextToken = tokenPlain || deviceTokenPlain(device) || device.mqtt_token;
+    const nextClientId = body.mqtt_client_id || device.mqtt_client_id;
+    try {
+      await assertMqttFieldsUnique({
+        token: nextToken,
+        clientId: nextClientId,
+        excludeDeviceId: device.id,
+      });
+    } catch (err) {
+      if (err && err.payload && err.status) {
+        return res.status(err.status).json(err.payload);
+      }
+      throw err;
+    }
     await query(
       `UPDATE devices SET
          name = ?, serial = ?, location = ?, default_gateway = ?,
@@ -373,7 +406,7 @@ router.put("/devices/:id/broker", requireAuth, requireAdmin, async (req, res, ne
         body.default_gateway ?? device.default_gateway,
         tokenPlain || device.mqtt_token,
         tokenEnc || device.mqtt_token_enc,
-        body.mqtt_client_id || device.mqtt_client_id,
+        nextClientId,
         body.mqtt_username || null,
         body.notes ?? device.notes,
         device.id,
@@ -388,18 +421,23 @@ router.put("/devices/:id/broker", requireAuth, requireAdmin, async (req, res, ne
   }
 });
 
-router.get("/calls", requireAuth, async (req, res, next) => {
+router.get("/calls", requireAuthOrKey, async (req, res, next) => {
   try {
-    const rows = await query(
-      `SELECT * FROM pbx_calls ORDER BY id DESC LIMIT 200`
-    );
+    const appId = await resolveAppId(req);
+    const device = await getPrimaryBrokerDevice(appId);
+    const rows = device
+      ? await query(
+          `SELECT * FROM pbx_calls WHERE pbx_device_id = ? ORDER BY id DESC LIMIT 200`,
+          [device.id]
+        )
+      : [];
     res.json({ status: "success", data: rows });
   } catch (err) {
     next(err);
   }
 });
 
-router.get("/calls/:id", requireAuth, async (req, res, next) => {
+router.get("/calls/:id", requireAuthOrKey, async (req, res, next) => {
   try {
     const rows = await query("SELECT * FROM pbx_calls WHERE id = ?", [
       req.params.id,
@@ -413,12 +451,13 @@ router.get("/calls/:id", requireAuth, async (req, res, next) => {
   }
 });
 
-router.post("/calls", requireAuth, clickLimiter, async (req, res, next) => {
+router.post("/calls", requireAuthOrKey, clickLimiter, async (req, res, next) => {
   try {
     const body = req.body || {};
+    const appId = await resolveAppId(req);
     const device = body.deviceId
       ? await getDevice(body.deviceId)
-      : await getPrimaryBrokerDevice();
+      : await getPrimaryBrokerDevice(appId);
     if (!device) {
       return res.status(404).json({ status: "error", message: "No PBX device" });
     }
@@ -443,17 +482,58 @@ router.post("/calls", requireAuth, clickLimiter, async (req, res, next) => {
       });
     }
 
-    const extension = String(body.extension || req.user.extension || "").trim();
+    // API token + extension: dial from that desk extension.
+    // If a user is mapped to the extension in Users, attach them as actor.
+    let actorId = req.user?.id || null;
+    let extension = String(
+      body.extension || body.ext || req.user?.extension || ""
+    ).trim();
+
     if (!extension) {
       return res.status(400).json({
         status: "error",
-        message: "No extension mapped to your user",
+        message: "Pass extension (e.g. \"1001\") with the customer phoneNumber.",
       });
+    }
+
+    const mapped = await query(
+      `SELECT id, extension, name FROM users
+       WHERE extension = ? AND status = 'active' AND (app_id = ? OR app_id IS NULL)
+       ORDER BY id ASC LIMIT 1`,
+      [extension, appId]
+    );
+    if (mapped[0]) {
+      actorId = mapped[0].id;
     }
 
     const phone = normalizePhoneNumber(body.phoneNumber || body.caller_id_number);
     if (!phone.ok) {
       return res.status(400).json({ status: "error", message: phone.error });
+    }
+
+    device._crmUserId = actorId;
+
+    // Clear stuck line quickly before dial — full livecall+wait made every
+    // click-to-call take many seconds before the customer number was even dialed.
+    const extStatusRows = await query(
+      `SELECT current_status FROM pbx_extensions
+       WHERE pbx_device_id = ? AND extension_number = ? LIMIT 1`,
+      [device.id, extension]
+    );
+    const extSt = String(extStatusRows[0]?.current_status || "").toLowerCase();
+    if (
+      body.forceRelease ||
+      ["inuse", "in use", "busy", "ringing"].includes(extSt)
+    ) {
+      try {
+        await releaseExtension(device, extension, {
+          quick: true,
+          liveTimeoutMs: 2000,
+        });
+        await sleep(200);
+      } catch {
+        /* still attempt dial */
+      }
     }
 
     const requestId = adapter.newRequestId();
@@ -466,7 +546,7 @@ router.post("/calls", requireAuth, clickLimiter, async (req, res, next) => {
        VALUES (?, ?, ?, ?, ?, ?, ?, 'outbound', 'extnCall', 'requested')`,
       [
         device.id,
-        req.user.id,
+        actorId,
         body.contactId || null,
         requestId,
         extension,
@@ -481,7 +561,7 @@ router.post("/calls", requireAuth, clickLimiter, async (req, res, next) => {
        VALUES (?, ?, 'extnCall', ?, ?, ?, 'auto_answer', 'dispatching', ?)`,
       [
         device.id,
-        req.user.id,
+        actorId,
         extension,
         phone.dial,
         gateway,
@@ -496,7 +576,7 @@ router.post("/calls", requireAuth, clickLimiter, async (req, res, next) => {
        VALUES (?, ?, ?, ?, ?, ?, ?, 'outbound', 'requested', NOW())`,
       [
         device.id,
-        req.user.id,
+        actorId,
         body.contactId || null,
         legacy.insertId,
         requestId,
@@ -513,42 +593,27 @@ router.post("/calls", requireAuth, clickLimiter, async (req, res, next) => {
       autoAnswer: true,
     });
 
-    device._crmUserId = req.user.id;
     await query(
       `UPDATE pbx_calls SET call_status = 'published' WHERE id = ?`,
       [callInsert.insertId]
     );
 
-    // If CRM thinks the line is busy, clear stuck channels before dialing
-    const extStatusRows = await query(
-      `SELECT current_status FROM pbx_extensions
-       WHERE pbx_device_id = ? AND extension_number = ? LIMIT 1`,
-      [device.id, extension]
-    );
-    const extSt = String(extStatusRows[0]?.current_status || "").toLowerCase();
-    if (
-      body.forceRelease ||
-      ["inuse", "in use", "busy", "ringing"].includes(extSt)
-    ) {
-      try {
-        await releaseExtension(device, extension);
-        await sleep(900);
-      } catch {
-        /* still attempt dial */
-      }
-    }
-
     let result;
     try {
       result = await publishCommand(device, built.topicSuffix, built.payload, {
         wait: true,
+        timeoutMs: DIAL_ACK_TIMEOUT_MS,
       });
     } catch (err) {
       if (isBusyExtensionError(err)) {
         try {
           await setExtensionStatus(device.id, extension, "inuse");
-          await releaseExtension(device, extension);
-          await sleep(1000);
+          await releaseExtension(device, extension, {
+            quick: true,
+            liveTimeoutMs: 2500,
+            excludeCallIds: [callInsert.insertId],
+          });
+          await sleep(250);
           const retryRequestId = adapter.newRequestId();
           await query(
             `UPDATE pbx_calls SET request_id = ?, call_status = 'published', ended_at = NULL WHERE id = ?`,
@@ -562,23 +627,39 @@ router.post("/calls", requireAuth, clickLimiter, async (req, res, next) => {
             device,
             built.topicSuffix,
             { ...built.payload, request_id: retryRequestId },
-            { wait: true }
+            { wait: true, timeoutMs: DIAL_ACK_TIMEOUT_MS }
           );
         } catch (retryErr) {
-          await query(
-            `UPDATE pbx_calls SET call_status = 'timed_out', ended_at = NOW() WHERE id = ?`,
-            [callInsert.insertId]
-          );
-          await query(
-            `UPDATE pbx_call_requests SET status = 'timed_out', error_message = ? WHERE request_id = ? OR request_id = ?`,
-            [retryErr.message, requestId, requestId]
-          );
-          await query(`UPDATE calls SET status = 'failed', message = ? WHERE id = ?`, [
-            retryErr.message,
-            legacy.insertId,
-          ]);
-          throw retryErr;
+          if (isMqttTimeoutError(retryErr) && retryErr.published) {
+            result = {
+              requestId: retryErr.requestId || requestId,
+              published: true,
+              response: null,
+            };
+          } else {
+            await query(
+              `UPDATE pbx_calls SET call_status = 'timed_out', ended_at = NOW() WHERE id = ?`,
+              [callInsert.insertId]
+            );
+            await query(
+              `UPDATE pbx_call_requests SET status = 'timed_out', error_message = ? WHERE request_id = ? OR request_id = ?`,
+              [retryErr.message, requestId, requestId]
+            );
+            await query(`UPDATE calls SET status = 'failed', message = ? WHERE id = ?`, [
+              retryErr.message,
+              legacy.insertId,
+            ]);
+            await setExtensionStatus(device.id, extension, "idle");
+            throw retryErr;
+          }
         }
+      } else if (isMqttTimeoutError(err) && err.published) {
+        // Dial already on the broker — ring should start; don't fail the click-to-call.
+        result = {
+          requestId: err.requestId || requestId,
+          published: true,
+          response: null,
+        };
       } else {
         await query(
           `UPDATE pbx_calls SET call_status = 'timed_out', ended_at = NOW() WHERE id = ?`,
@@ -592,6 +673,7 @@ router.post("/calls", requireAuth, clickLimiter, async (req, res, next) => {
           err.message,
           legacy.insertId,
         ]);
+        await setExtensionStatus(device.id, extension, "idle");
         throw err;
       }
     }
@@ -605,17 +687,43 @@ router.post("/calls", requireAuth, clickLimiter, async (req, res, next) => {
     );
     await query(
       `UPDATE pbx_call_requests SET status = 'acknowledged', acknowledged_at = NOW() WHERE request_id = ?`,
-      [requestId]
+      [result.requestId || requestId]
     );
     await query(
       `UPDATE calls SET status = 'success', uuid = COALESCE(?, uuid), message = ? WHERE id = ?`,
-      [callId, "Dial accepted by Neron (broker)", legacy.insertId]
+      [
+        callId,
+        result.response
+          ? "Dial accepted by Neron (broker)"
+          : "Dial published to Neron (awaiting events)",
+        legacy.insertId,
+      ]
     );
+
+    // Only mark desk ringing when Neron returned a real callid. Soft-publish
+    // without callid used to leave CRM "On a call" forever while PBX stayed idle.
+    if (callId) {
+      await setExtensionStatus(device.id, extension, "ringing");
+    } else {
+      const orphanId = callInsert.insertId;
+      setTimeout(() => {
+        query(
+          `UPDATE pbx_calls
+           SET call_status = 'timed_out', ended_at = COALESCE(ended_at, NOW()),
+               hangup_cause = COALESCE(hangup_cause, 'no_callid')
+           WHERE id = ? AND call_id IS NULL
+             AND call_status IN ('published','acknowledged','requested')`,
+          [orphanId]
+        )
+          .then(() => setExtensionStatus(device.id, extension, "idle"))
+          .catch(() => {});
+      }, 25000);
+    }
 
     await audit("click_to_call", {
       deviceId: device.id,
-      userId: req.user.id,
-      detail: { requestId, extension, phone: phone.dial },
+      userId: actorId,
+      detail: { requestId: result.requestId || requestId, extension, phone: phone.dial },
     });
 
     const row = (
@@ -633,7 +741,7 @@ router.post("/calls", requireAuth, clickLimiter, async (req, res, next) => {
   }
 });
 
-router.post("/calls/:id/hangup", requireAuth, async (req, res, next) => {
+router.post("/calls/:id/hangup", requireAuthOrKey, async (req, res, next) => {
   try {
     const rows = await query("SELECT * FROM pbx_calls WHERE id = ?", [
       req.params.id,
@@ -649,7 +757,8 @@ router.post("/calls/:id/hangup", requireAuth, async (req, res, next) => {
       });
     }
     const device = await getDevice(call.pbx_device_id);
-    device._crmUserId = req.user.id;
+    const actorId = req.user?.id || null;
+    device._crmUserId = actorId;
     const requestId = adapter.newRequestId();
     const built = adapter.hangupCall({ requestId, callId: call.call_id });
     await publishCommand(device, built.topicSuffix, built.payload, { wait: true });
@@ -662,7 +771,7 @@ router.post("/calls/:id/hangup", requireAuth, async (req, res, next) => {
     }
     await audit("hangup", {
       deviceId: device.id,
-      userId: req.user.id,
+      userId: actorId,
       detail: { callId: call.call_id },
     });
     const updated = (

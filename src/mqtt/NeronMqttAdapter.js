@@ -64,6 +64,8 @@ class NeronMqttAdapter {
     phoneNumber,
     gateway,
     autoAnswer = true,
+    playFile = null,
+    playText = null,
   }) {
     const payload = this.wrap(this.dial.cmd, {
       request_id: requestId,
@@ -74,6 +76,14 @@ class NeronMqttAdapter {
     if (autoAnswer) {
       payload[this.dial.autoAnswerField] = this.dial.autoAnswerValue;
       payload.auto_answer = "1";
+    }
+    if (playFile) {
+      payload[this.dial.playFileField || "playfile"] = String(playFile);
+      payload.playfile = String(playFile);
+    }
+    if (playText) {
+      payload[this.dial.playTextField || "playtext"] = String(playText);
+      payload.playtext = String(playText);
     }
     if (gateway) payload.gateway = gateway;
     return { topicSuffix: "call", payload };
@@ -101,6 +111,23 @@ class NeronMqttAdapter {
       payload: this.wrap("hangup", {
         request_id: requestId,
         callid: callId,
+      }),
+    };
+  }
+
+  /**
+   * Redirect / transfer a live call to an extension (firmware may use transfer or redirect).
+   */
+  transferCall({ requestId, callId, destination }) {
+    const cmd = process.env.NERON_TRANSFER_CMD || "transfer";
+    return {
+      topicSuffix: "call",
+      payload: this.wrap(cmd, {
+        request_id: requestId,
+        callid: callId,
+        destination: String(destination),
+        callee: String(destination),
+        target: String(destination),
       }),
     };
   }

@@ -9,9 +9,24 @@ const {
   mapNeronEventToState,
 } = require("./callStateMachine");
 const { liveBus } = require("../realtime/liveBus");
+const {
+  resolveInbound,
+  recordDecision,
+  phoneMatchKey,
+} = require("../inbound/engine");
 
 const adapter = new NeronMqttAdapter();
 const pending = new PendingRequestManager();
+
+const ACTIVE_CALL_STATUSES = [
+  "requested",
+  "published",
+  "acknowledged",
+  "extension_ringing",
+  "customer_dialling",
+  "customer_ringing",
+  "answered",
+];
 
 let client = null;
 let connected = false;
@@ -20,6 +35,8 @@ let invalidMessageCount = 0;
 let commandTimeoutCount = 0;
 let starting = false;
 const processedEventKeys = new Set();
+/** Active inbound hunt timers: callId → { timer, index, hunt, decisionId, device } */
+const inboundHunts = new Map();
 
 function logInfo(msg, extra = {}) {
   console.log(`[mqtt-broker] ${msg}`, sanitizeLog(extra));
@@ -114,6 +131,138 @@ async function setExtensionStatus(deviceId, extension, status) {
     extension: String(extension),
     status: st,
   });
+}
+
+/**
+ * Close ACTIVE CRM call rows for an extension (missed hangup/CDR / soft-publish orphans).
+ * Returns the closed row ids.
+ */
+async function closeActiveCallsForExtension(
+  extension,
+  {
+    deviceId = null,
+    reason = "hungup",
+    olderThanSec = 0,
+    onlyWithoutCallId = false,
+    excludeCallIds = [],
+  } = {}
+) {
+  const ext = String(extension || "").trim();
+  if (!ext) return [];
+
+  const excludeIds = new Set(
+    (excludeCallIds || [])
+      .map((id) => Number(id))
+      .filter((id) => Number.isFinite(id) && id > 0)
+  );
+
+  const params = [ext, ...ACTIVE_CALL_STATUSES];
+  let extra = "";
+  if (olderThanSec > 0) {
+    extra += " AND started_at < DATE_SUB(NOW(), INTERVAL ? SECOND)";
+    params.push(Number(olderThanSec));
+  }
+  if (onlyWithoutCallId) {
+    extra += " AND (call_id IS NULL OR call_id = '')";
+  }
+  if (excludeIds.size) {
+    extra += ` AND id NOT IN (${[...excludeIds].map(() => "?").join(",")})`;
+    params.push(...excludeIds);
+  }
+
+  const rows = await query(
+    `SELECT id, call_status, call_id, customer_number, extension_number
+     FROM pbx_calls
+     WHERE extension_number = ?
+       AND call_status IN (${ACTIVE_CALL_STATUSES.map(() => "?").join(",")})${extra}
+     ORDER BY id DESC`,
+    params
+  );
+  if (!rows.length) return [];
+
+  const ids = rows.map((r) => r.id);
+  await query(
+    `UPDATE pbx_calls
+     SET call_status = ?, ended_at = COALESCE(ended_at, NOW()), hangup_cause = COALESCE(hangup_cause, ?)
+     WHERE id IN (${ids.map(() => "?").join(",")})`,
+    [reason, reason === "hungup" ? "crm_reconcile" : reason, ...ids]
+  );
+
+  for (const row of rows) {
+    liveBus.broadcast("pbx_call", {
+      type: "call_status",
+      data: { ...row, call_status: reason, ended_at: new Date().toISOString() },
+    });
+  }
+
+  if (deviceId) {
+    await setExtensionStatus(deviceId, ext, "idle");
+  }
+
+  return ids;
+}
+
+/**
+ * Heal sticky "ringing / on a call" when PBX is idle or dial never got a callid.
+ * - no call_id after 25s → orphan soft-publish
+ * - any active row older than 4 minutes → force close
+ */
+async function reconcileExtensionPresence(deviceId, extension) {
+  const ext = String(extension || "").trim();
+  if (!ext) return { closedIds: [], status: "idle", active: null };
+
+  const closedNoId = await closeActiveCallsForExtension(ext, {
+    deviceId: null,
+    reason: "timed_out",
+    olderThanSec: 25,
+    onlyWithoutCallId: true,
+  });
+  const closedOld = await closeActiveCallsForExtension(ext, {
+    deviceId: null,
+    reason: "hungup",
+    olderThanSec: 240,
+  });
+  const closedIds = [...closedNoId, ...closedOld];
+
+  const active = (
+    await query(
+      `SELECT id, call_id, call_status, customer_number, started_at, answered_at
+       FROM pbx_calls
+       WHERE extension_number = ?
+         AND call_status IN (${ACTIVE_CALL_STATUSES.map(() => "?").join(",")})
+       ORDER BY id DESC LIMIT 1`,
+      [ext, ...ACTIVE_CALL_STATUSES]
+    )
+  )[0] || null;
+
+  const extRows = await query(
+    `SELECT current_status, last_status_at FROM pbx_extensions
+     WHERE pbx_device_id = ? AND extension_number = ? LIMIT 1`,
+    [deviceId, ext]
+  );
+  let status = String(extRows[0]?.current_status || "idle").toLowerCase();
+
+  // Never keep CRM busy when there is no live call row.
+  if (!active && (status === "ringing" || status === "inuse" || status === "busy")) {
+    await setExtensionStatus(deviceId, ext, "idle");
+    status = "idle";
+  } else if (active && (status === "idle" || status === "unknown" || !status)) {
+    // Prefer real call only briefly — avoid resurrecting forever after missed hangups.
+    const startedMs = active.started_at ? new Date(active.started_at).getTime() : 0;
+    const ageSec = startedMs ? (Date.now() - startedMs) / 1000 : 9999;
+    if (active.call_id && ageSec < 90) {
+      status = active.call_status === "answered" ? "inuse" : "ringing";
+    } else if (!active.call_id || ageSec >= 90) {
+      await closeActiveCallsForExtension(ext, {
+        deviceId,
+        reason: active.call_id ? "hungup" : "timed_out",
+      });
+      status = "idle";
+      return { closedIds: [...closedIds, active.id], status: "idle", active: null };
+    }
+  }
+
+  return { closedIds, status, active };
 }
 
 async function applyCallState(callRow, nextState, extra = {}) {
@@ -310,13 +459,31 @@ async function handleEvent(device, parsed) {
     await applyCallState(callRow, next, { call_id: parsed.callId, raw: parsed.json });
   }
 
-  // Extension status table
+  // Extension status table — when PBX reports idle, close orphan CRM "live" rows.
   if (parsed.event === "extension_status" && parsed.json.extension) {
-    await setExtensionStatus(
-      device.id,
-      parsed.json.extension,
-      parsed.json.status || "unknown"
+    const extNum = parsed.json.extension;
+    const st = String(parsed.json.status || "unknown").toLowerCase();
+    if (st === "idle") {
+      await closeActiveCallsForExtension(extNum, {
+        deviceId: device.id,
+        reason: "hungup",
+      });
+    } else {
+      await setExtensionStatus(device.id, extNum, st);
+    }
+  }
+
+  if (String(parsed.event || "").toLowerCase() === "invite") {
+    await maybeRouteInbound(device, parsed).catch((err) =>
+      logWarn("inbound route failed", { err: err.message })
     );
+  }
+
+  if (
+    parsed.callId &&
+    ["answered", "hangup", "cdr"].includes(String(parsed.event || "").toLowerCase())
+  ) {
+    clearInboundHunt(parsed.callId, parsed.event);
   }
 
   liveBus.broadcast("pbx_event", {
@@ -324,6 +491,190 @@ async function handleEvent(device, parsed) {
     event: parsed.event,
     callId: parsed.callId,
     data: parsed.json,
+  });
+}
+
+function extractInboundCaller(json = {}) {
+  const keys = [
+    "from",
+    "caller",
+    "src",
+    "cid_num",
+    "callerid",
+    "caller_id_number",
+    "ani",
+    "number",
+  ];
+  for (const key of keys) {
+    const raw = json[key];
+    if (raw == null) continue;
+    const digits = String(raw).replace(/\D/g, "");
+    if (digits.length >= 8) return String(raw);
+  }
+  return "";
+}
+
+function extractInboundDid(json = {}) {
+  const keys = ["to", "called", "callee", "dst", "did", "destination"];
+  for (const key of keys) {
+    if (json[key] != null && String(json[key]).trim()) return String(json[key]);
+  }
+  return "";
+}
+
+function looksLikeExternalCaller(value) {
+  const digits = String(value || "").replace(/\D/g, "");
+  if (digits.length >= 8) return true;
+  return false;
+}
+
+function clearInboundHunt(callId, reason = "") {
+  const entry = inboundHunts.get(String(callId));
+  if (!entry) return;
+  clearTimeout(entry.timer);
+  inboundHunts.delete(String(callId));
+  if (entry.decisionId && /answer/i.test(String(reason))) {
+    query(
+      `UPDATE inbound_decisions SET status = 'answered' WHERE id = ?`,
+      [entry.decisionId]
+    ).catch(() => {});
+  }
+}
+
+async function transferToExtension(device, callId, extension) {
+  const requestId = adapter.newRequestId();
+  const built = adapter.transferCall({
+    requestId,
+    callId,
+    destination: extension,
+  });
+  await publishCommand(device, built.topicSuffix, built.payload, {
+    wait: false,
+  });
+}
+
+function scheduleInboundFailover(device, callId, hunt, index, decisionId) {
+  const step = hunt[index];
+  if (!step) return;
+  const waitMs = Math.max(5, Number(step.timeoutSec) || 20) * 1000;
+  const timer = setTimeout(() => {
+    void (async () => {
+      const current = inboundHunts.get(String(callId));
+      if (!current) return;
+      const nextIndex = index + 1;
+      const next = hunt[nextIndex];
+      if (!next) {
+        inboundHunts.delete(String(callId));
+        await query(
+          `UPDATE inbound_decisions SET status = 'missed' WHERE id = ?`,
+          [decisionId]
+        ).catch(() => {});
+        return;
+      }
+      try {
+        await transferToExtension(device, callId, next.extension);
+        await query(
+          `UPDATE inbound_decisions SET status = 'overflow', first_extension = ? WHERE id = ?`,
+          [next.extension, decisionId]
+        ).catch(() => {});
+        scheduleInboundFailover(device, callId, hunt, nextIndex, decisionId);
+      } catch (err) {
+        logWarn("inbound failover transfer failed", {
+          callId,
+          ext: next.extension,
+          err: err.message,
+        });
+        inboundHunts.delete(String(callId));
+      }
+    })();
+  }, waitMs);
+  inboundHunts.set(String(callId), {
+    timer,
+    index,
+    hunt,
+    decisionId,
+    deviceId: device.id,
+  });
+}
+
+async function maybeRouteInbound(device, parsed) {
+  const json = parsed.json || {};
+  const callerRaw = extractInboundCaller(json);
+  if (!looksLikeExternalCaller(callerRaw)) return;
+  const did = extractInboundDid(json);
+  // Skip internal extension-to-extension invites (short "to" already handled elsewhere)
+  const toDigits = String(did || "").replace(/\D/g, "");
+  const fromDigits = String(callerRaw || "").replace(/\D/g, "");
+  if (fromDigits.length <= 5 && toDigits.length <= 5) return;
+
+  const appId = device.app_id;
+  if (!appId) return;
+
+  const callId = parsed.callId || json.callid || json.uuid || null;
+  if (callId && inboundHunts.has(String(callId))) return;
+
+  const preview = await resolveInbound(appId, { from: callerRaw, to: did });
+  if (!preview.ok || !preview.firstExtension) {
+    if (preview.ok) {
+      await recordDecision(appId, preview, { status: "missed", callId });
+    }
+    return;
+  }
+
+  const decisionId = await recordDecision(appId, preview, {
+    status: "routed",
+    callId,
+  });
+
+  // Persist inbound call row for UI / sticky later
+  if (callId) {
+    const existing = await query(
+      `SELECT id FROM pbx_calls WHERE call_id = ? LIMIT 1`,
+      [callId]
+    );
+    if (!existing[0]) {
+      await query(
+        `INSERT INTO pbx_calls
+          (pbx_device_id, request_id, call_id, extension_number, customer_number,
+           direction, call_status, started_at, ringing_at)
+         VALUES (?, ?, ?, ?, ?, 'inbound', 'extension_ringing', NOW(), NOW())
+         ON DUPLICATE KEY UPDATE
+           extension_number = VALUES(extension_number),
+           customer_number = VALUES(customer_number),
+           direction = 'inbound',
+           call_status = 'extension_ringing'`,
+        [
+          device.id,
+          parsed.requestId || `inbound-${callId}`,
+          callId,
+          preview.firstExtension,
+          preview.callerDial || phoneMatchKey(callerRaw),
+        ]
+      );
+    }
+  }
+
+  try {
+    if (callId) {
+      await transferToExtension(device, callId, preview.firstExtension);
+      if (preview.hunt.length > 1) {
+        scheduleInboundFailover(
+          device,
+          callId,
+          preview.hunt,
+          0,
+          decisionId
+        );
+      }
+    }
+  } catch (err) {
+    logWarn("inbound transfer publish failed", { err: err.message });
+  }
+
+  liveBus.broadcast("pbx_inbound", {
+    deviceId: device.id,
+    callId,
+    preview,
   });
 }
 
@@ -366,7 +717,7 @@ async function handleCdr(device, parsed) {
     );
   }
 
-  // After CDR, mark extension idle so next click-to-call is not blocked
+  // After CDR, mark extension idle and close any leftover ACTIVE rows for that desk.
   const ext =
     (callRow && callRow.extension_number) ||
     parsed.json.caller ||
@@ -374,6 +725,11 @@ async function handleCdr(device, parsed) {
     parsed.json.extension ||
     null;
   if (ext) {
+    await closeActiveCallsForExtension(ext, {
+      deviceId: device.id,
+      reason: "hungup",
+      excludeCallIds: callRow?.id ? [callRow.id] : [],
+    });
     await setExtensionStatus(device.id, ext, "idle");
   }
 
@@ -499,7 +855,12 @@ function connectBroker() {
   });
 }
 
-async function publishCommand(device, topicSuffix, payload, { wait = true } = {}) {
+async function publishCommand(
+  device,
+  topicSuffix,
+  payload,
+  { wait = true, timeoutMs } = {}
+) {
   if (!client || !connected) {
     throw new Error("MQTT broker not connected");
   }
@@ -509,6 +870,10 @@ async function publishCommand(device, topicSuffix, payload, { wait = true } = {}
   const requestId = payload.request_id || adapter.newRequestId();
   payload.request_id = requestId;
   const topic = adapter.topic(token, "command", topicSuffix);
+  const waitMs =
+    typeof timeoutMs === "number" && timeoutMs > 0
+      ? timeoutMs
+      : config.callCommandTimeoutMs;
 
   await query(
     `INSERT INTO pbx_mqtt_requests
@@ -527,7 +892,11 @@ async function publishCommand(device, topicSuffix, payload, { wait = true } = {}
 
   let waiter = null;
   if (wait) {
-    waiter = pending.add(requestId, { deviceId: device.id, cmd: payload.cmd }, config.callCommandTimeoutMs);
+    waiter = pending.add(
+      requestId,
+      { deviceId: device.id, cmd: payload.cmd },
+      waitMs
+    );
   }
 
   await new Promise((resolve, reject) => {
@@ -548,12 +917,56 @@ async function publishCommand(device, topicSuffix, payload, { wait = true } = {}
     const response = await waiter;
     return { requestId, published: true, response };
   } catch (err) {
-    commandTimeoutCount += 1;
-    await query(
-      `UPDATE pbx_mqtt_requests SET status = 'timed_out', completed_at = NOW() WHERE request_id = ?`,
+    // Late ACK race: response may land just after the waiter times out.
+    // Prefer the DB response over a blind timeout so "not idle" / Success
+    // are not treated as soft-publish successes.
+    await new Promise((r) => setTimeout(r, 150));
+    const rows = await query(
+      `SELECT status, response_json FROM pbx_mqtt_requests WHERE request_id = ? LIMIT 1`,
       [requestId]
     );
-    throw err;
+    const row = rows[0];
+    let late = null;
+    if (row?.response_json) {
+      try {
+        late =
+          typeof row.response_json === "string"
+            ? JSON.parse(row.response_json)
+            : row.response_json;
+      } catch {
+        late = null;
+      }
+    }
+    if (late && typeof late === "object") {
+      if (adapter.isSuccessResponse(late)) {
+        return { requestId, published: true, response: late, lateAck: true };
+      }
+      const fail = new Error(
+        late.message || late.status || err.message || "Command failed"
+      );
+      fail.published = true;
+      fail.requestId = requestId;
+      fail.response = late;
+      throw fail;
+    }
+
+    const msg = String(err?.message || err || "");
+    const isTimeout =
+      msg.toLowerCase().includes("timed out") ||
+      msg.toLowerCase().includes("timeout");
+    if (isTimeout) {
+      commandTimeoutCount += 1;
+      await query(
+        `UPDATE pbx_mqtt_requests
+         SET status = 'timed_out', completed_at = COALESCE(completed_at, NOW())
+         WHERE request_id = ? AND status = 'published'`,
+        [requestId]
+      );
+    }
+    const e = err instanceof Error ? err : new Error(String(err));
+    e.published = true;
+    e.requestId = requestId;
+    throw e;
   }
 }
 
@@ -570,18 +983,20 @@ async function sendDeviceCommand(deviceRow, builderFn, opts) {
   return publishCommand(device, topicSuffix, payload, opts);
 }
 
-async function hangupCall(deviceRow, callId) {
-  return sendDeviceCommand(deviceRow, (requestId) =>
-    adapter.hangupCall({ requestId, callId })
+async function hangupCall(deviceRow, callId, opts = {}) {
+  return sendDeviceCommand(
+    deviceRow,
+    (requestId) => adapter.hangupCall({ requestId, callId }),
+    opts
   );
 }
 
 
-async function fetchLiveCalls(deviceProp) {
+async function fetchLiveCalls(deviceRow, opts = {}) {
   const result = await sendDeviceCommand(
     deviceRow,
     (requestId) => adapter.liveCall(requestId),
-    { wait: true }
+    { wait: true, timeoutMs: opts.timeoutMs, ...opts }
   );
   const json = result.response || {};
   if (Array.isArray(json.livecall)) return json.livecall;
@@ -590,20 +1005,32 @@ async function fetchLiveCalls(deviceProp) {
   return [];
 }
 
-const ACTIVE_CALL_STATUSES = [
-  "requested",
-  "published",
-  "acknowledged",
-  "extension_ringing",
-  "customer_dialling",
-  "customer_ringing",
-  "answered",
-];
-
-/** Hang up live channels for an extension and mark it idle (fixes stuck "not idle"). */
-async function releaseExtension(deviceProp, extension) {
+/**
+ * Hang up live channels for an extension and mark it idle.
+ * opts.fast: skip livecall; hangup only known CRM call_ids (no MQTT wait).
+ * opts.quick: short livecall (default 2s) + fire-and-forget hangups — for click-to-call.
+ * opts.excludeCallIds: pbx_calls.id values to keep (current dial row).
+ */
+async function releaseExtension(deviceProp, extension, opts = {}) {
   const ext = String(extension || "").trim();
   if (!ext) throw new Error("Extension required");
+  const quick = Boolean(opts.quick);
+  const fast = Boolean(opts.fast) && !quick;
+  const hangupWait =
+    opts.hangupWait != null ? Boolean(opts.hangupWait) : !(fast || quick);
+  const liveTimeoutMs =
+    typeof opts.liveTimeoutMs === "number"
+      ? opts.liveTimeoutMs
+      : quick
+        ? 2000
+        : fast
+          ? 1500
+          : config.callCommandTimeoutMs;
+  const excludeIds = new Set(
+    (opts.excludeCallIds || [])
+      .map((id) => Number(id))
+      .filter((id) => Number.isFinite(id) && id > 0)
+  );
 
   const callIds = new Set();
   const dbCalls = await query(
@@ -615,46 +1042,77 @@ async function releaseExtension(deviceProp, extension) {
     [ext, ...ACTIVE_CALL_STATUSES]
   );
   for (const row of dbCalls) {
+    if (excludeIds.has(Number(row.id))) continue;
     if (row.call_id) callIds.add(String(row.call_id));
   }
 
-  try {
-    const live = await fetchLiveCalls(deviceProp);
-    for (const item of live || []) {
-      if (!item || typeof item !== "object") continue;
-      const caller = String(
-        item.caller || item.cid_num || item.extension || item.src || ""
-      );
-      if (caller === ext || caller.endsWith(`/${ext}`) || caller.endsWith(ext)) {
-        const id = item.callid || item.uuid || item.call_id;
-        if (id) callIds.add(String(id));
+  // Clear CRM state first so a stuck "busy" does not block the next dial.
+  const clearParams = [ext, ...ACTIVE_CALL_STATUSES];
+  let excludeSql = "";
+  if (excludeIds.size) {
+    excludeSql = ` AND id NOT IN (${[...excludeIds].map(() => "?").join(",")})`;
+    clearParams.push(...excludeIds);
+  }
+  await query(
+    `UPDATE pbx_calls
+     SET call_status = 'hungup', ended_at = COALESCE(ended_at, NOW())
+     WHERE extension_number = ?
+       AND call_status IN (${ACTIVE_CALL_STATUSES.map(() => "?").join(",")})${excludeSql}`,
+    clearParams
+  );
+
+  for (const row of dbCalls) {
+    if (excludeIds.has(Number(row.id))) continue;
+    liveBus.broadcast("pbx_call", {
+      type: "call_status",
+      data: {
+        id: row.id,
+        call_id: row.call_id,
+        extension_number: ext,
+        call_status: "hungup",
+        ended_at: new Date().toISOString(),
+      },
+    });
+  }
+
+  const deviceId = deviceProp.id || deviceProp.pbx_device_id;
+  if (deviceId) {
+    await setExtensionStatus(deviceId, ext, "idle");
+  }
+
+  if (!fast) {
+    try {
+      const live = await fetchLiveCalls(deviceProp, { timeoutMs: liveTimeoutMs });
+      for (const item of live || []) {
+        if (!item || typeof item !== "object") continue;
+        const caller = String(
+          item.caller || item.cid_num || item.extension || item.src || ""
+        );
+        if (
+          caller === ext ||
+          caller.endsWith(`/${ext}`) ||
+          caller.endsWith(ext)
+        ) {
+          const id = item.callid || item.uuid || item.call_id;
+          if (id) callIds.add(String(id));
+        }
       }
+    } catch (err) {
+      logWarn("livecall during release failed", { ext, err: err.message });
     }
-  } catch (err) {
-    logWarn("livecall during release failed", { ext, err: err.message });
   }
 
   const results = [];
   for (const callId of callIds) {
     try {
-      await hangupCall(deviceProp, callId);
+      await hangupCall(deviceProp, callId, {
+        wait: hangupWait,
+        timeoutMs: hangupWait ? liveTimeoutMs : 1500,
+      });
       results.push({ callId, ok: true });
     } catch (err) {
       results.push({ callId, ok: false, error: err.message });
     }
-  }
-
-  await query(
-    `UPDATE pbx_calls
-     SET call_status = 'hungup', ended_at = COALESCE(ended_at, NOW())
-     WHERE extension_number = ?
-       AND call_status IN (${ACTIVE_CALL_STATUSES.map(() => "?").join(",")})`,
-    [ext, ...ACTIVE_CALL_STATUSES]
-  );
-
-  const deviceId = deviceProp.id || deviceProp.pbx_device_id;
-  if (deviceId) {
-    await setExtensionStatus(deviceId, ext, "idle");
   }
 
   return {
@@ -699,8 +1157,11 @@ module.exports = {
   fetchLiveCalls,
   releaseExtension,
   setExtensionStatus,
+  closeActiveCallsForExtension,
+  reconcileExtensionPresence,
   probeDevice,
   health,
   shutdown,
   loadDevices,
+  ACTIVE_CALL_STATUSES,
 };

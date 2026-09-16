@@ -15,6 +15,7 @@ function signUser(user) {
       mobile: user.mobile,
       extension: user.extension,
       role: user.role,
+      app_id: user.app_id || null,
     },
     config.jwtSecret,
     { expiresIn: "7d" }
@@ -37,7 +38,8 @@ function requireAuth(req, res, next) {
 }
 
 function requireAdmin(req, res, next) {
-  if (!req.user || req.user.role !== "admin") {
+  const role = String(req.user?.role || "");
+  if (role !== "admin" && role !== "owner") {
     return res.status(403).json({ status: "error", message: "Admin only" });
   }
   return next();
@@ -46,13 +48,39 @@ function requireAdmin(req, res, next) {
 async function findApiKey(value) {
   if (!value) return null;
   if (config.apiKey && value === config.apiKey) {
-    return { source: "env" };
+    return { source: "env", key_type: "app", name: "env-API_KEY" };
   }
   const rows = await query(
-    "SELECT id, name FROM api_keys WHERE api_key = ? AND active = 1 LIMIT 1",
+    `SELECT id, name, key_type, user_id, app_id
+     FROM api_keys
+     WHERE api_key = ? AND active = 1
+     LIMIT 1`,
     [value]
   );
   return rows[0] || null;
+}
+
+async function attachUserFromKey(req, key) {
+  req.apiClient = key;
+  if (key.key_type === "user" && key.user_id) {
+    const users = await query(
+      `SELECT id, name, mobile, extension, role, status, app_id
+       FROM users WHERE id = ? LIMIT 1`,
+      [key.user_id]
+    );
+    if (users[0] && users[0].status !== "disabled") {
+      req.user = {
+        id: users[0].id,
+        name: users[0].name,
+        mobile: users[0].mobile,
+        extension: users[0].extension,
+        role: users[0].role,
+        app_id: users[0].app_id || key.app_id || null,
+      };
+    }
+  } else if (key.app_id) {
+    req.appId = key.app_id;
+  }
 }
 
 async function requireAuthOrKey(req, res, next) {
@@ -70,13 +98,13 @@ async function requireAuthOrKey(req, res, next) {
 
   const key = await findApiKey(headerKey || bearer);
   if (key) {
-    req.apiClient = key;
+    await attachUserFromKey(req, key);
     return next();
   }
 
   return res.status(401).json({
     status: "error",
-    message: "Login or API key required",
+    message: "Login or developer token required (X-Api-Key)",
   });
 }
 

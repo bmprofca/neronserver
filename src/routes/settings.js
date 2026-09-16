@@ -7,12 +7,18 @@ const { requireAuth, requireAdmin } = require("../middleware/auth");
 
 const { encryptSecret } = require("../security/secrets");
 const { subscribeAll } = require("../mqtt/brokerService");
+const { resolveAppId, ensureDefaultApp, getAppDevice, assertMqttFieldsUnique, deviceTokenPlain } = require("../appsHelper");
 
 const router = express.Router();
 
 router.use(requireAuth, requireAdmin);
 
-async function getPrimaryDevice() {
+async function getPrimaryDevice(req) {
+  const appId = req ? await resolveAppId(req) : null;
+  if (appId) {
+    const d = await getAppDevice(appId);
+    if (d) return d;
+  }
   const rows = await query("SELECT * FROM devices ORDER BY id ASC LIMIT 1");
   return rows[0] || null;
 }
@@ -72,7 +78,7 @@ function toPublicDevice(device) {
 
 router.get("/neron", async (req, res, next) => {
   try {
-    const device = await getPrimaryDevice();
+    const device = await getPrimaryDevice(req);
     res.json({ status: "success", data: toPublicDevice(device) });
   } catch (err) {
     next(err);
@@ -81,7 +87,8 @@ router.get("/neron", async (req, res, next) => {
 
 router.put("/neron", async (req, res, next) => {
   try {
-    const existing = await getPrimaryDevice();
+    const existing = await getPrimaryDevice(req);
+    const appId = (await resolveAppId(req)) || (await ensureDefaultApp()).id;
     const body = req.body || {};
     const mode =
       body.integration_mode === "cloud"
@@ -147,13 +154,28 @@ router.put("/neron", async (req, res, next) => {
       status: existing?.status || "unknown",
     };
 
+    const checkToken = values.mqtt_token || (existing ? deviceTokenPlain(existing) : null);
+    try {
+      await assertMqttFieldsUnique({
+        token: checkToken,
+        clientId: values.mqtt_client_id,
+        excludeDeviceId: existing?.id || null,
+      });
+    } catch (err) {
+      if (err && err.payload && err.status) {
+        return res.status(err.status).json(err.payload);
+      }
+      throw err;
+    }
+
     if (!existing) {
       const result = await query(
         `INSERT INTO devices
           (name, model, api_enabled, integration_mode, api_type, mqtt_host,
            mqtt_port, mqtt_username, mqtt_password, mqtt_client_id, mqtt_token,
-           mqtt_token_enc, base_url, luci_api_url, default_gateway, notes, status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           mqtt_token_enc, base_url, luci_api_url, default_gateway, notes, status,
+           app_id, organization_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           values.name,
           values.model,
@@ -172,6 +194,8 @@ router.put("/neron", async (req, res, next) => {
           values.default_gateway,
           values.notes,
           values.status,
+          appId,
+          appId,
         ]
       );
       if (mode === "broker") {
@@ -192,7 +216,8 @@ router.put("/neron", async (req, res, next) => {
        SET name = ?, api_enabled = ?, integration_mode = ?, api_type = ?,
            mqtt_host = ?, mqtt_port = ?, mqtt_username = ?, mqtt_password = ?,
            mqtt_client_id = ?, mqtt_token = ?, mqtt_token_enc = ?, base_url = ?,
-           luci_api_url = ?, default_gateway = ?, notes = ?
+           luci_api_url = ?, default_gateway = ?, notes = ?,
+           app_id = COALESCE(app_id, ?), organization_id = COALESCE(organization_id, ?)
        WHERE id = ?`,
       [
         values.name,
@@ -210,6 +235,8 @@ router.put("/neron", async (req, res, next) => {
         values.luci_api_url,
         values.default_gateway,
         values.notes,
+        appId,
+        appId,
         existing.id,
       ]
     );
@@ -300,7 +327,7 @@ router.post("/test-neron", async (req, res) => {
   const started = Date.now();
   try {
     const body = req.body || {};
-    const saved = await getPrimaryDevice();
+    const saved = await getPrimaryDevice(req);
     const mode =
       body.integration_mode === "broker" ||
       saved?.integration_mode === "broker" ||
@@ -512,14 +539,63 @@ router.post("/test-neron", async (req, res) => {
 
 router.get("/api-keys", async (req, res, next) => {
   try {
-    const rows = await query(
-      `SELECT id, name,
-              CONCAT(LEFT(api_key, 8), '••••••••', RIGHT(api_key, 4)) AS api_key_masked,
-              active, created_at
-       FROM api_keys
-       ORDER BY id DESC`
+    const appId = await resolveAppId(req);
+    // One live token per app — drop older duplicates
+    const all = await query(
+      `SELECT id FROM api_keys
+       WHERE app_id = ? AND active = 1
+       ORDER BY id DESC`,
+      [appId]
     );
-    res.json({ status: "success", data: rows });
+    if (all.length > 1) {
+      const keepId = all[0].id;
+      await query(
+        `DELETE FROM api_keys WHERE app_id = ? AND id != ?`,
+        [appId, keepId]
+      );
+    }
+
+    const rows = await query(
+      `SELECT k.id, k.name,
+              CONCAT(LEFT(k.api_key, 8), '••••••••', RIGHT(k.api_key, 4)) AS api_key_masked,
+              k.active, k.created_at, k.app_id
+       FROM api_keys k
+       WHERE k.app_id = ? AND k.active = 1
+       ORDER BY k.id DESC
+       LIMIT 1`,
+      [appId]
+    );
+    res.json({ status: "success", data: rows[0] || null });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get("/api-keys/live", async (req, res, next) => {
+  try {
+    const appId = await resolveAppId(req);
+    const rows = await query(
+      `SELECT id, name, api_key, active, created_at
+       FROM api_keys
+       WHERE app_id = ? AND active = 1
+       ORDER BY id DESC
+       LIMIT 1`,
+      [appId]
+    );
+    if (!rows[0]) {
+      return res.status(404).json({ status: "error", message: "No live API token" });
+    }
+    res.json({
+      status: "success",
+      data: {
+        id: rows[0].id,
+        name: rows[0].name,
+        api_key: rows[0].api_key,
+        api_key_masked: `${String(rows[0].api_key).slice(0, 8)}••••••••${String(rows[0].api_key).slice(-4)}`,
+        active: rows[0].active,
+        created_at: rows[0].created_at,
+      },
+    });
   } catch (err) {
     next(err);
   }
@@ -527,22 +603,29 @@ router.get("/api-keys", async (req, res, next) => {
 
 router.post("/api-keys", async (req, res, next) => {
   try {
-    const name = String(req.body?.name || "").trim();
-    if (!name) {
-      return res.status(400).json({
-        status: "error",
-        message: "Give this key a name, e.g. CRM or LAN Agent",
-      });
-    }
+    const appId = (await resolveAppId(req)) || (await ensureDefaultApp()).id;
+    const name = String(req.body?.name || "").trim() || "Live API token";
+
     const apiKey = `nrn_${crypto.randomBytes(24).toString("hex")}`;
+    // Replace any existing tokens — only one live key
+    await query(`DELETE FROM api_keys WHERE app_id = ?`, [appId]);
     const result = await query(
-      "INSERT INTO api_keys (name, api_key, active) VALUES (?, ?, 1)",
-      [name, apiKey]
+      `INSERT INTO api_keys (name, key_type, user_id, api_key, active, app_id)
+       VALUES (?, 'app', NULL, ?, 1, ?)`,
+      [name, apiKey, appId]
     );
     res.status(201).json({
       status: "success",
-      data: { id: result.insertId, name, api_key: apiKey, active: 1 },
-      message: "Copy this key now. It will not be shown in full again.",
+      data: {
+        id: result.insertId,
+        name,
+        key_type: "app",
+        user_id: null,
+        app_id: appId,
+        api_key: apiKey,
+        active: 1,
+      },
+      message: "Live API token created. Previous tokens were revoked.",
     });
   } catch (err) {
     next(err);
@@ -551,9 +634,11 @@ router.post("/api-keys", async (req, res, next) => {
 
 router.delete("/api-keys/:id", async (req, res, next) => {
   try {
-    const result = await query("DELETE FROM api_keys WHERE id = ?", [
-      req.params.id,
-    ]);
+    const appId = await resolveAppId(req);
+    const result = await query(
+      "DELETE FROM api_keys WHERE id = ? AND app_id = ?",
+      [req.params.id, appId]
+    );
     if (!result.affectedRows) {
       return res.status(404).json({ status: "error", message: "Key not found" });
     }

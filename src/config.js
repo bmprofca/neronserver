@@ -38,7 +38,10 @@ module.exports = {
       process.env.NERON_DIAL_PERMISSION_FIELD || "dialpermission",
     autoAnswerField: process.env.NERON_DIAL_AUTOANSWER_FIELD || "autoanswer",
     autoAnswerValue: process.env.NERON_DIAL_AUTOANSWER_VALUE || "yes",
+    playFileField: process.env.NERON_DIAL_PLAYFILE_FIELD || "playfile",
+    playTextField: process.env.NERON_DIAL_PLAYTEXT_FIELD || "playtext",
   },
+  bulkDialAckTimeoutMs: Number(process.env.BULK_DIAL_ACK_TIMEOUT_MS) || 8000,
   db: {
     host: process.env.DB_HOST || "auth-db1754.hstgr.io",
     port: Number(process.env.DB_PORT) || 3306,
