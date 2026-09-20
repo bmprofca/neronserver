@@ -4,9 +4,20 @@ module.exports = {
   port: Number(process.env.PORT) || 5000,
   apiKey: process.env.API_KEY || "",
   jwtSecret: process.env.JWT_SECRET || "neron-cloud-jwt-change-me",
-  otpDevMode: process.env.OTP_DEV_MODE !== "false",
+  // Live SMS when FAST2SMS_API_KEY is set. OTP_DEV_MODE=true still returns/accepts default OTP for local testing.
+  otpDevMode: process.env.OTP_DEV_MODE === "true",
   defaultMobile: process.env.DEFAULT_MOBILE || "7002695990",
   defaultOtp: process.env.DEFAULT_OTP || "123456",
+  otpExpiryMinutes: Number(process.env.OTP_EXPIRY_MINUTES) || 10,
+  fast2sms: {
+    apiKey: process.env.FAST2SMS_API_KEY || "",
+    senderId: process.env.FAST2SMS_SENDER_ID || "ONESAA",
+    templateId: process.env.FAST2SMS_TEMPLATE_ID || "220273",
+    entityId:
+      process.env.FAST2SMS_ENTITY_ID || "1401687770000073525",
+    // Template {#var#} values. Use {otp} placeholder; extra vars: otp|name
+    variablesValues: process.env.FAST2SMS_VARIABLES_VALUES || "{otp}",
+  },
   tokenEncryptKey:
     process.env.DEVICE_TOKEN_ENCRYPT_KEY ||
     process.env.JWT_SECRET ||

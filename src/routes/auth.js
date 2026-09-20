@@ -8,8 +8,17 @@ const {
   publicApp,
   createAppWithBrokerDevice,
 } = require("../appsHelper");
+const {
+  generateOtp,
+  isSmsConfigured,
+  sendOtpSms,
+} = require("../sms/fast2sms");
 
 const router = express.Router();
+
+function allowDefaultOtpFallback() {
+  return Boolean(config.otpDevMode) || !isSmsConfigured();
+}
 
 function normalizeMobile(value) {
   const digits = String(value || "").replace(/\D/g, "");
@@ -80,23 +89,52 @@ router.post("/request-otp", async (req, res, next) => {
       });
     }
 
-    const code = config.defaultOtp;
+    const liveSms = isSmsConfigured();
+    if (!liveSms && !config.otpDevMode) {
+      return res.status(503).json({
+        status: "error",
+        message:
+          "SMS is not configured. Add FAST2SMS_API_KEY to server/.env and restart the server.",
+      });
+    }
+
+    const code = liveSms ? generateOtp(6) : config.defaultOtp;
+    const expiryMinutes = liveSms
+      ? Math.max(1, Number(config.otpExpiryMinutes) || 10)
+      : 30 * 24 * 60;
+
     await query("UPDATE otp_codes SET used = 1 WHERE mobile = ? AND used = 0", [
       mobile,
     ]);
     await query(
-      "INSERT INTO otp_codes (mobile, code, expires_at) VALUES (?, ?, DATE_ADD(NOW(), INTERVAL 30 DAY))",
-      [mobile, code]
+      "INSERT INTO otp_codes (mobile, code, expires_at) VALUES (?, ?, DATE_ADD(NOW(), INTERVAL ? MINUTE))",
+      [mobile, code, expiryMinutes]
     );
 
-    console.log(`OTP for ${mobile}: ${code}`);
+    if (liveSms) {
+      try {
+        await sendOtpSms(mobile, code);
+      } catch (smsErr) {
+        await query("UPDATE otp_codes SET used = 1 WHERE mobile = ? AND code = ?", [
+          mobile,
+          code,
+        ]);
+        return sendAuthError(res, smsErr, next);
+      }
+      console.log(`OTP SMS queued for ${mobile} via Fast2SMS (ONESAA / ${config.fast2sms.templateId})`);
+    } else {
+      console.log(`OTP for ${mobile}: ${code} (dev / SMS not configured)`);
+    }
 
     const payload = {
       status: "success",
-      message: "OTP sent. Use the default OTP to continue.",
+      message: liveSms
+        ? "OTP sent to your mobile via SMS."
+        : "OTP ready (SMS not configured — use the default OTP).",
       first_user: isFirstUser && !users[0],
       register: Boolean(isRegister),
       default_mobile: config.defaultMobile,
+      sms: liveSms,
     };
     if (config.otpDevMode) {
       payload.dev_otp = code;
@@ -120,7 +158,8 @@ router.post("/verify-otp", async (req, res, next) => {
       });
     }
 
-    const isDefaultOtp = code === config.defaultOtp;
+    const isDefaultOtp =
+      allowDefaultOtpFallback() && code === config.defaultOtp;
     const otps = await query(
       `SELECT * FROM otp_codes
        WHERE mobile = ? AND code = ? AND used = 0 AND expires_at > NOW()
@@ -235,7 +274,8 @@ router.post("/register", async (req, res, next) => {
       });
     }
 
-    const isDefaultOtp = code === config.defaultOtp;
+    const isDefaultOtp =
+      allowDefaultOtpFallback() && code === config.defaultOtp;
     const otps = await query(
       `SELECT * FROM otp_codes
        WHERE mobile = ? AND code = ? AND used = 0 AND expires_at > NOW()
