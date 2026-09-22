@@ -172,11 +172,61 @@ router.get("/", requireAuth, async (req, res, next) => {
        ORDER BY id DESC LIMIT 1`,
       [appId]
     );
+    const apps = await query(
+      `SELECT crm_webhook_url, crm_webhook_secret, crm_lookup_url, crm_lookup_auth_header
+       FROM apps WHERE id = ? LIMIT 1`,
+      [appId]
+    );
+    const app = apps[0] || {};
     res.json({
       status: "success",
       data: {
         appId,
         crmApiKey: keys[0]?.api_key || "",
+        crmWebhookUrl: app.crm_webhook_url || "",
+        crmWebhookSecret: app.crm_webhook_secret || "",
+        crmLookupUrl: app.crm_lookup_url || "",
+        crmLookupAuthHeader: app.crm_lookup_auth_header || "",
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** Alias used by CRM hub UI */
+router.put("/crm", requireAuth, requireAdmin, async (req, res, next) => {
+  try {
+    const appId = await resolveAppId(req);
+    const body = req.body || {};
+    await query(
+      `UPDATE apps SET
+        crm_webhook_url = ?,
+        crm_webhook_secret = ?,
+        crm_lookup_url = ?,
+        crm_lookup_auth_header = ?
+       WHERE id = ?`,
+      [
+        String(body.crmWebhookUrl || "").trim() || null,
+        String(body.crmWebhookSecret || "").trim() || null,
+        String(body.crmLookupUrl || "").trim() || null,
+        String(body.crmLookupAuthHeader || "").trim() || null,
+        appId,
+      ]
+    );
+    const apps = await query(
+      `SELECT crm_webhook_url, crm_webhook_secret, crm_lookup_url, crm_lookup_auth_header
+       FROM apps WHERE id = ? LIMIT 1`,
+      [appId]
+    );
+    const app = apps[0] || {};
+    res.json({
+      status: "success",
+      data: {
+        crmWebhookUrl: app.crm_webhook_url || "",
+        crmWebhookSecret: app.crm_webhook_secret || "",
+        crmLookupUrl: app.crm_lookup_url || "",
+        crmLookupAuthHeader: app.crm_lookup_auth_header || "",
       },
     });
   } catch (err) {

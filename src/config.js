@@ -12,11 +12,12 @@ module.exports = {
   fast2sms: {
     apiKey: process.env.FAST2SMS_API_KEY || "",
     senderId: process.env.FAST2SMS_SENDER_ID || "ONESAA",
-    templateId: process.env.FAST2SMS_TEMPLATE_ID || "220273",
+    // 220278 fills {#var#}. 220273 leaves {#OTP#} as literal text.
+    templateId: process.env.FAST2SMS_TEMPLATE_ID || "220278",
     entityId:
       process.env.FAST2SMS_ENTITY_ID || "1401687770000073525",
-    // Template {#var#} values. Use {otp} placeholder; extra vars: otp|name
-    variablesValues: process.env.FAST2SMS_VARIABLES_VALUES || "{otp}",
+    route: (process.env.FAST2SMS_ROUTE || "dlt").toLowerCase(),
+    variablesValues: process.env.FAST2SMS_VARIABLES_VALUES || "{var}",
   },
   tokenEncryptKey:
     process.env.DEVICE_TOKEN_ENCRYPT_KEY ||

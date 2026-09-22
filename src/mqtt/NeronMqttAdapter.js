@@ -50,6 +50,41 @@ class NeronMqttAdapter {
     };
   }
 
+  /**
+   * Enable extension login on Neron (LuCI SIP page).
+   * Per Neron API PDF / dilex: cfg/extension_set with logout_status "0" = logged in.
+   */
+  prepareExtension({ requestId, extension, fullname, permission }) {
+    return {
+      topicSuffix: "cfg",
+      payload: this.wrap("extension_set", {
+        request_id: requestId,
+        extension: String(extension),
+        params: {
+          logout_status: "0",
+          fullname: String(fullname || extension),
+          permission: String(permission != null ? permission : "3"),
+        },
+      }),
+    };
+  }
+
+  /** logout_status "1" = logged out on PBX */
+  logoutExtension({ requestId, extension }) {
+    return {
+      topicSuffix: "cfg",
+      payload: this.wrap("extension_set", {
+        request_id: requestId,
+        extension: String(extension),
+        params: {
+          logout_status: "1",
+          fullname: String(extension),
+          permission: "3",
+        },
+      }),
+    };
+  }
+
   getTrunks(requestId) {
     return {
       topicSuffix: "system",

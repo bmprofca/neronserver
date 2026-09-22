@@ -34,6 +34,8 @@ function publicUser(user, app = null) {
     role: user.role,
     status: user.status,
     app_id: user.app_id || null,
+    phoneMode: String(user.phone_mode || "desk").toLowerCase() === "sip" ? "sip" : "desk",
+    sipPasswordSet: Boolean(user.sip_password_enc),
     app: app ? publicApp(app) : null,
   };
 }

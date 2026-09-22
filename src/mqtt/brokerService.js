@@ -14,6 +14,7 @@ const {
   recordDecision,
   phoneMatchKey,
 } = require("../inbound/engine");
+const { screenPopIncoming } = require("../crm/screenPop");
 
 const adapter = new NeronMqttAdapter();
 const pending = new PendingRequestManager();
@@ -226,7 +227,8 @@ async function reconcileExtensionPresence(deviceId, extension) {
 
   const active = (
     await query(
-      `SELECT id, call_id, call_status, customer_number, started_at, answered_at
+      `SELECT id, call_id, call_status, extension_number, customer_number,
+              direction, duration_seconds, started_at, answered_at
        FROM pbx_calls
        WHERE extension_number = ?
          AND call_status IN (${ACTIVE_CALL_STATUSES.map(() => "?").join(",")})
@@ -627,13 +629,28 @@ async function maybeRouteInbound(device, parsed) {
   });
 
   // Persist inbound call row for UI / sticky later
+  let inboundCallId = null;
   if (callId) {
     const existing = await query(
       `SELECT id FROM pbx_calls WHERE call_id = ? LIMIT 1`,
       [callId]
     );
-    if (!existing[0]) {
+    if (existing[0]) {
+      inboundCallId = existing[0].id;
       await query(
+        `UPDATE pbx_calls
+         SET extension_number = ?, customer_number = ?, direction = 'inbound',
+             call_status = 'extension_ringing',
+             ringing_at = COALESCE(ringing_at, NOW())
+         WHERE id = ?`,
+        [
+          preview.firstExtension,
+          preview.callerDial || phoneMatchKey(callerRaw),
+          inboundCallId,
+        ]
+      );
+    } else {
+      const ins = await query(
         `INSERT INTO pbx_calls
           (pbx_device_id, request_id, call_id, extension_number, customer_number,
            direction, call_status, started_at, ringing_at)
@@ -651,6 +668,17 @@ async function maybeRouteInbound(device, parsed) {
           preview.callerDial || phoneMatchKey(callerRaw),
         ]
       );
+      inboundCallId = ins.insertId || null;
+      if (!inboundCallId) {
+        const again = await query(
+          `SELECT id FROM pbx_calls WHERE call_id = ? LIMIT 1`,
+          [callId]
+        );
+        inboundCallId = again[0]?.id || null;
+      }
+    }
+    if (preview.firstExtension) {
+      await setExtensionStatus(device.id, preview.firstExtension, "ringing");
     }
   }
 
@@ -674,8 +702,51 @@ async function maybeRouteInbound(device, parsed) {
   liveBus.broadcast("pbx_inbound", {
     deviceId: device.id,
     callId,
+    callDbId: inboundCallId,
+    extension: preview.firstExtension,
+    callerPhone: preview.callerDial || phoneMatchKey(callerRaw),
+    callerName: preview.callerName || "",
     preview,
   });
+  liveBus.broadcast("pbx_call", {
+    type: "inbound_ringing",
+    data: {
+      id: inboundCallId,
+      call_id: callId,
+      extension_number: preview.firstExtension,
+      customer_number: preview.callerDial || phoneMatchKey(callerRaw),
+      direction: "inbound",
+      call_status: "extension_ringing",
+      caller_name: preview.callerName || "",
+    },
+  });
+
+  // CRM screen-pop: resolve {name} from CRM/local DB and POST to CRM webhook
+  try {
+    const pop = await screenPopIncoming(appId, {
+      phone: preview.callerDial || phoneMatchKey(callerRaw),
+      name: preview.callerName || "",
+      extension: preview.firstExtension,
+      callId: callId || inboundCallId,
+      did,
+    });
+    if (pop.vars.name && !preview.callerName) {
+      preview.callerName = pop.vars.name;
+      liveBus.broadcast("pbx_inbound", {
+        deviceId: device.id,
+        callId,
+        callDbId: inboundCallId,
+        extension: preview.firstExtension,
+        callerPhone: pop.vars.phone,
+        callerName: pop.vars.name,
+        preview,
+        name_source: pop.resolved.source,
+      });
+    }
+    liveBus.broadcast("crm_screen_pop", { appId, ...pop.payload });
+  } catch (err) {
+    logWarn("crm screen-pop failed", { err: err.message });
+  }
 }
 
 async function handleCdr(device, parsed) {

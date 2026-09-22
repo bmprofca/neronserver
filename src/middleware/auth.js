@@ -37,6 +37,51 @@ function requireAuth(req, res, next) {
   }
 }
 
+/**
+ * Like requireAuth, but if JWT was signed by another host that shares this DB
+ * (e.g. production token → local contacts API), accept the payload when the
+ * user id still exists. Used only for read-only name/directory lookups.
+ */
+async function requireAuthSharedDb(req, res, next) {
+  const token =
+    readBearer(req) ||
+    String(req.query.access_token || req.query.token || "").trim();
+  if (!token) {
+    return res.status(401).json({ status: "error", message: "Login required" });
+  }
+  try {
+    req.user = jwt.verify(token, config.jwtSecret);
+    return next();
+  } catch {
+    try {
+      const payload = jwt.decode(token);
+      const id = payload && typeof payload === "object" ? payload.id : null;
+      if (!id) {
+        return res.status(401).json({ status: "error", message: "Session expired" });
+      }
+      const rows = await query(
+        `SELECT id, name, mobile, extension, role, status, app_id
+         FROM users WHERE id = ? LIMIT 1`,
+        [id]
+      );
+      if (!rows[0] || rows[0].status === "disabled") {
+        return res.status(401).json({ status: "error", message: "Session expired" });
+      }
+      req.user = {
+        id: rows[0].id,
+        name: rows[0].name,
+        mobile: rows[0].mobile,
+        extension: rows[0].extension,
+        role: rows[0].role,
+        app_id: rows[0].app_id || null,
+      };
+      return next();
+    } catch {
+      return res.status(401).json({ status: "error", message: "Session expired" });
+    }
+  }
+}
+
 function requireAdmin(req, res, next) {
   const role = String(req.user?.role || "");
   if (role !== "admin" && role !== "owner") {
@@ -134,6 +179,7 @@ async function requireApiKey(req, res, next) {
 module.exports = {
   signUser,
   requireAuth,
+  requireAuthSharedDb,
   requireAdmin,
   requireAuthOrKey,
   requireApiKey,

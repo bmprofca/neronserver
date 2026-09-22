@@ -63,8 +63,15 @@ app.use("/api/inbound", require("./routes/inbound"));
 app.use("/api/org", require("./routes/org"));
 app.use("/api/cdr", require("./routes/cdr"));
 app.use("/api/bulk", require("./routes/bulk"));
+app.use("/api/contacts", require("./routes/contacts"));
+app.use("/api/crm", require("./routes/crm"));
+app.use("/api/softphone", require("./routes/softphone"));
 // Public CRM alias used by inbound API docs / partners
 app.use("/api/v1/inbound", require("./routes/inbound"));
+app.use("/api/v1/contacts", require("./routes/contacts"));
+app.use("/api/v1/crm", require("./routes/crm"));
+app.use("/api/v1/softphone", require("./routes/softphone"));
+app.use("/api/v1", require("./routes/crm")); // /api/v1/call action=receive
 
 app.use(express.static(publicDir));
 app.get("*", (req, res, next) => {

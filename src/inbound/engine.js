@@ -283,6 +283,7 @@ async function resolveInbound(appId, { from, to } = {}) {
     caller: caller.display || caller.dial,
     callerDial: caller.dial,
     matchKey: caller.matchKey,
+    callerName: mapping?.name || "",
     did,
     mappedExtension,
     stickyExtension,

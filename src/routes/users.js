@@ -1,12 +1,17 @@
 const express = require("express");
 const { query } = require("../db");
-const { requireAuth, requireAdmin, requireAuthOrKey } = require("../middleware/auth");
+const { requireAuth, requireAuthSharedDb, requireAdmin, requireAuthOrKey } = require("../middleware/auth");
 const { resolveAppId, ensureDefaultApp } = require("../appsHelper");
+const { encryptSecret } = require("../security/secrets");
 
 const router = express.Router();
 
 function normalizeMobile(value) {
   return String(value || "").replace(/\D/g, "");
+}
+
+function normalizePhoneMode(value, fallback = "desk") {
+  return String(value || fallback).toLowerCase() === "sip" ? "sip" : "desk";
 }
 
 function publicUser(user) {
@@ -19,6 +24,8 @@ function publicUser(user) {
     status: user.status,
     app_id: user.app_id || null,
     created_at: user.created_at,
+    phoneMode: normalizePhoneMode(user.phone_mode),
+    sipPasswordSet: Boolean(user.sip_password_enc),
   };
 }
 
@@ -74,6 +81,30 @@ router.get("/", requireAuthOrKey, async (req, res, next) => {
   }
 });
 
+/** Lightweight phone book for call popups — available to every signed-in role. */
+router.get("/directory", requireAuthSharedDb, async (req, res, next) => {
+  try {
+    const appId = await resolveAppId(req);
+    const rows = await query(
+      `SELECT name, mobile, extension FROM users
+       WHERE app_id = ? AND status = 'active'
+         AND mobile IS NOT NULL AND mobile != ''
+       ORDER BY name ASC`,
+      [appId]
+    );
+    res.json({
+      status: "success",
+      data: rows.map((u) => ({
+        name: u.name || "",
+        mobile: u.mobile || "",
+        extension: u.extension || "",
+      })),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.post("/", requireAuth, requireAdmin, async (req, res, next) => {
   try {
     const appId = (await resolveAppId(req)) || (await ensureDefaultApp()).id;
@@ -90,11 +121,14 @@ router.post("/", requireAuth, requireAdmin, async (req, res, next) => {
     }
 
     const claimed = await claimExclusiveExtension(appId, 0, extension);
+    const phoneMode = normalizePhoneMode(req.body?.phoneMode || req.body?.phone_mode);
+    const sipPlain = String(req.body?.sipPassword || req.body?.sip_password || "");
+    const sipEnc = sipPlain ? encryptSecret(sipPlain) : null;
 
     const result = await query(
-      `INSERT INTO users (name, mobile, extension, role, status, app_id)
-       VALUES (?, ?, ?, ?, 'active', ?)`,
-      [name, mobile, claimed.extension, role, appId]
+      `INSERT INTO users (name, mobile, extension, role, status, app_id, phone_mode, sip_password_enc)
+       VALUES (?, ?, ?, ?, 'active', ?, ?, ?)`,
+      [name, mobile, claimed.extension, role, appId, phoneMode, sipEnc]
     );
     const rows = await query("SELECT * FROM users WHERE id = ?", [
       result.insertId,
@@ -138,6 +172,16 @@ router.put("/:id", requireAuth, requireAdmin, async (req, res, next) => {
         : current[0].extension;
     const role = req.body?.role || current[0].role;
     const status = req.body?.status || current[0].status;
+    const phoneMode =
+      req.body?.phoneMode != null || req.body?.phone_mode != null
+        ? normalizePhoneMode(req.body.phoneMode || req.body.phone_mode)
+        : normalizePhoneMode(current[0].phone_mode);
+
+    let sipEnc = current[0].sip_password_enc;
+    if (req.body?.sipPassword != null || req.body?.sip_password != null) {
+      const plain = String(req.body.sipPassword || req.body.sip_password || "");
+      sipEnc = plain ? encryptSecret(plain) : null;
+    }
 
     const claimed = await claimExclusiveExtension(
       appId,
@@ -147,9 +191,20 @@ router.put("/:id", requireAuth, requireAdmin, async (req, res, next) => {
 
     await query(
       `UPDATE users
-       SET name = ?, mobile = ?, extension = ?, role = ?, status = ?
+       SET name = ?, mobile = ?, extension = ?, role = ?, status = ?,
+           phone_mode = ?, sip_password_enc = ?
        WHERE id = ? AND app_id = ?`,
-      [name, mobile, claimed.extension, role, status, req.params.id, appId]
+      [
+        name,
+        mobile,
+        claimed.extension,
+        role,
+        status,
+        phoneMode,
+        sipEnc,
+        req.params.id,
+        appId,
+      ]
     );
     const rows = await query("SELECT * FROM users WHERE id = ?", [req.params.id]);
     res.json({

@@ -531,6 +531,65 @@ async function migrate() {
       CONSTRAINT fk_bulk_items_campaign FOREIGN KEY (campaign_id) REFERENCES bulk_campaigns(id) ON DELETE CASCADE
     )
   `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS app_contacts (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      app_id INT NOT NULL,
+      name VARCHAR(120) NOT NULL,
+      phone VARCHAR(40) NOT NULL,
+      phone_key VARCHAR(20) NOT NULL,
+      company VARCHAR(160) NULL,
+      email VARCHAR(160) NULL,
+      notes TEXT NULL,
+      created_by INT NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY uq_app_contacts_phone (app_id, phone_key),
+      INDEX idx_app_contacts_app (app_id, name),
+      CONSTRAINT fk_app_contacts_app FOREIGN KEY (app_id) REFERENCES apps(id) ON DELETE CASCADE
+    )
+  `);
+
+  // CRM screen-pop: webhook to CRM UI + optional CRM DB name lookup by phone
+  await addColumnIfMissing("apps", "crm_webhook_url", "TEXT NULL");
+  await addColumnIfMissing("apps", "crm_webhook_secret", "VARCHAR(120) NULL");
+  await addColumnIfMissing(
+    "apps",
+    "crm_lookup_url",
+    "TEXT NULL"
+  );
+  await addColumnIfMissing(
+    "apps",
+    "crm_lookup_auth_header",
+    "VARCHAR(255) NULL"
+  );
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS crm_deliveries (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      app_id INT NOT NULL,
+      event VARCHAR(60) NOT NULL DEFAULT 'incoming_call',
+      url TEXT NOT NULL,
+      payload_json TEXT NULL,
+      status_code INT NULL,
+      response_body TEXT NULL,
+      error_message VARCHAR(500) NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_crm_deliveries_app (app_id, created_at),
+      CONSTRAINT fk_crm_deliveries_app FOREIGN KEY (app_id) REFERENCES apps(id) ON DELETE CASCADE
+    )
+  `);
+
+  // Browser softphone (JsSIP / WebRTC)
+  await addColumnIfMissing("apps", "sip_host", "VARCHAR(255) NULL");
+  await addColumnIfMissing("apps", "sip_ws_url", "VARCHAR(512) NULL");
+  await addColumnIfMissing("users", "sip_password_enc", "TEXT NULL");
+  await addColumnIfMissing(
+    "users",
+    "phone_mode",
+    "VARCHAR(20) NOT NULL DEFAULT 'desk'"
+  );
 }
 
 module.exports = { migrate };

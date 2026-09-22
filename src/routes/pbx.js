@@ -2,7 +2,7 @@ const express = require("express");
 const rateLimit = require("express-rate-limit");
 const { query } = require("../db");
 const config = require("../config");
-const { requireAuth, requireAdmin, requireAuthOrKey } = require("../middleware/auth");
+const { requireAuth, requireAuthSharedDb, requireAdmin, requireAuthOrKey } = require("../middleware/auth");
 const { encryptSecret, decryptSecret, maskToken } = require("../security/secrets");
 const { normalizePhoneNumber } = require("../utils/phone");
 const {
@@ -17,6 +17,7 @@ const {
 } = require("../mqtt/brokerService");
 const { liveBus } = require("../realtime/liveBus");
 const { resolveAppId, assertMqttFieldsUnique, deviceTokenPlain } = require("../appsHelper");
+const { phoneMatchKey } = require("../inbound/engine");
 
 const router = express.Router();
 
@@ -152,6 +153,148 @@ router.get("/events", requireAuth, (req, res) => {
 
 router.get("/mqtt/health", requireAuth, (req, res) => {
   res.json({ status: "success", data: mqttHealth() });
+});
+
+/** Resolve display name + last call for a customer number. */
+router.get("/caller-lookup", requireAuthSharedDb, async (req, res, next) => {
+  try {
+    const appId = await resolveAppId(req);
+    const key = phoneMatchKey(req.query.phone || req.query.number || "");
+    if (!key || key.length < 8) {
+      return res.json({
+        status: "success",
+        data: { phone: "", name: "", company: "", source: null, lastCall: null },
+      });
+    }
+    const like = `%${key}`;
+    let name = "";
+    let company = "";
+    let phoneOut = key;
+    let source = null;
+
+    const mapped = await query(
+      `SELECT name, phone FROM inbound_mappings
+       WHERE app_id = ? AND enabled = 1 AND match_key = ?
+       ORDER BY id DESC LIMIT 1`,
+      [appId, key]
+    );
+    if (mapped[0]?.name) {
+      name = String(mapped[0].name).trim();
+      phoneOut = mapped[0].phone || key;
+      source = "inbound_map";
+    }
+
+    if (!name) {
+      const people = await query(
+        `SELECT name, mobile FROM users
+         WHERE status = 'active'
+           AND (
+             mobile = ?
+             OR mobile = ?
+             OR RIGHT(REPLACE(REPLACE(mobile, '+', ''), ' ', ''), 10) = ?
+           )
+         ORDER BY id ASC
+         LIMIT 1`,
+        [key, `0${key}`, key]
+      );
+      if (people[0]?.name) {
+        name = String(people[0].name).trim();
+        phoneOut = people[0].mobile || key;
+        source = "user";
+      }
+    }
+
+    if (!name) {
+      const book = await query(
+        `SELECT name, phone, company FROM app_contacts
+         WHERE app_id = ?
+           AND (
+             phone_key = ?
+             OR phone = ?
+             OR phone LIKE ?
+             OR RIGHT(REPLACE(REPLACE(phone, '+', ''), ' ', ''), 10) = ?
+           )
+         ORDER BY id DESC
+         LIMIT 1`,
+        [appId, key, key, like, key]
+      );
+      if (book[0]?.name) {
+        name = String(book[0].name).trim();
+        company = String(book[0].company || "").trim();
+        phoneOut = book[0].phone || key;
+        source = "contacts";
+      }
+    }
+
+    if (!name) {
+      const bulk = await query(
+        `SELECT c.name, c.phone, g.name AS group_name
+         FROM bulk_contacts c
+         INNER JOIN bulk_groups g ON g.id = c.group_id
+         WHERE g.app_id = ?
+           AND (
+             c.phone_key = ?
+             OR c.phone = ?
+             OR c.phone LIKE ?
+             OR RIGHT(REPLACE(REPLACE(c.phone, '+', ''), ' ', ''), 10) = ?
+           )
+           AND c.name IS NOT NULL AND TRIM(c.name) != ''
+         ORDER BY c.id DESC
+         LIMIT 1`,
+        [appId, key, key, like, key]
+      );
+      if (bulk[0]?.name) {
+        name = String(bulk[0].name).trim();
+        company = String(bulk[0].group_name || "").trim();
+        phoneOut = bulk[0].phone || key;
+        source = "bulk_contact";
+      }
+    }
+
+    const lastRows = await query(
+      `SELECT c.*, u.name AS agent_name
+       FROM pbx_calls c
+       INNER JOIN devices d ON d.id = c.pbx_device_id
+       LEFT JOIN users u
+         ON u.app_id = d.app_id AND u.extension = c.extension_number
+       WHERE d.app_id = ?
+         AND c.customer_number IS NOT NULL
+         AND (
+           c.customer_number = ?
+           OR c.customer_number LIKE ?
+           OR RIGHT(REPLACE(REPLACE(c.customer_number, '+', ''), ' ', ''), 10) = ?
+         )
+         AND c.call_status NOT IN (${ACTIVE_CALL_STATUSES.map(() => "?").join(",")})
+       ORDER BY COALESCE(c.ended_at, c.answered_at, c.started_at, c.created_at) DESC, c.id DESC
+       LIMIT 1`,
+      [appId, key, like, key, ...ACTIVE_CALL_STATUSES]
+    );
+    const last = lastRows[0] || null;
+    const lastCall = last
+      ? {
+          at: last.ended_at || last.answered_at || last.started_at || last.created_at,
+          direction: last.direction || "outbound",
+          state: last.call_status || "",
+          duration: Number(last.duration_seconds || 0) || 0,
+          hangupCause: last.hangup_cause || "",
+          agentName: last.agent_name || "",
+          agentExtension: last.extension_number || "",
+        }
+      : null;
+
+    res.json({
+      status: "success",
+      data: {
+        phone: phoneOut || key,
+        name,
+        company,
+        source,
+        lastCall,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
 router.get("/extensions", requireAuthOrKey, async (req, res, next) => {
