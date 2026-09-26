@@ -649,7 +649,14 @@ router.post("/calls", requireAuthOrKey, clickLimiter, async (req, res, next) => 
       actorId = mapped[0].id;
     }
 
-    const phone = normalizePhoneNumber(body.phoneNumber || body.caller_id_number);
+    const phone = normalizePhoneNumber(
+      body.phoneNumber ||
+        body.caller_id_number ||
+        body.phone ||
+        body.number ||
+        body.mobile ||
+        body.to
+    );
     if (!phone.ok) {
       return res.status(400).json({ status: "error", message: phone.error });
     }

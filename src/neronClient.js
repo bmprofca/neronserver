@@ -14,16 +14,20 @@ function parseUuid(message) {
 
 function normalizeDialNumber(input) {
   let digits = String(input || "").replace(/\D/g, "");
+  // Country code form only (12 digits). Do NOT strip 91 from a 10-digit mobile.
   if (digits.startsWith("91") && digits.length === 12) {
     digits = digits.slice(2);
   }
   if (digits.startsWith("0") && digits.length === 11) {
-    return digits;
+    digits = digits.slice(1);
   }
-  if (digits.length === 10) {
-    return `0${digits}`;
+  if (digits.length > 10 && /^[6-9]\d{9}$/.test(digits.slice(-10))) {
+    digits = digits.slice(-10);
   }
-  return digits;
+  if (digits.length !== 10) return digits;
+  // Avoid 0+91… PBX ISD collision → "invalid number"
+  if (digits.startsWith("91")) return digits;
+  return `0${digits}`;
 }
 
 function shortError(text, max = 180) {
